@@ -9,7 +9,9 @@ from tkinter.scrolledtext import ScrolledText
 
 from .client import TVCFClient, TVCFError
 from .config import load_config, save_config
+from .diagnostics import SessionLog, classify_error, save_error_case
 from .downloader import DownloadCancelled, download_media
+from .issue_reporter import report_error_cases
 from .models import MediaItem
 
 
@@ -39,7 +41,8 @@ COLORS = {
     "log_red": "#f87171",
 }
 
-DEFERRED_RETRY_STATUSES = {"오류", "중단됨", "보류"}
+ERROR_STATUSES = {"오류", "상세 오류", "네트워크 오류", "스트림 없음", "yt-dlp 실패", "ffmpeg 실패", "파일 손상", "알 수 없는 오류"}
+DEFERRED_RETRY_STATUSES = ERROR_STATUSES | {"중단됨", "보류"}
 
 
 class DownloaderApp:
@@ -63,6 +66,8 @@ class DownloaderApp:
         self.retry_lock = threading.Lock()
         self.run_summary = ""
         self.last_checkpoint = self.config.get("last_checkpoint", "작업 없음")
+        self.error_case_by_id: dict[str, str] = {}
+        self.session_log: SessionLog | None = None
 
         today = datetime.now().date()
         default_from = today - timedelta(days=30)
@@ -349,7 +354,8 @@ class DownloaderApp:
         header.columnconfigure(0, weight=1)
         self._section_title(header, "다운로드 목록", "list").grid(row=0, column=0, sticky="w")
         ttk.Button(header, text="체크 재다운로드", command=self._retry_selected_item, style="Text.TButton").grid(row=0, column=1, sticky="e", padx=(0, 8))
-        ttk.Button(header, text="보류 일괄 재다운로드", command=self._retry_deferred_items, style="Text.TButton").grid(row=0, column=2, sticky="e")
+        ttk.Button(header, text="보류 일괄 재다운로드", command=self._retry_deferred_items, style="Text.TButton").grid(row=0, column=2, sticky="e", padx=(0, 8))
+        ttk.Button(header, text="기훈이한테 이르기", command=self._report_selected_errors, style="Text.TButton").grid(row=0, column=3, sticky="e")
 
         table_wrap = ttk.Frame(card, style="Surface.TFrame")
         table_wrap.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
@@ -565,6 +571,34 @@ class DownloaderApp:
     def _retry_selected_item(self) -> None:
         self._queue_checked_retries()
 
+    def _report_selected_errors(self) -> None:
+        row_ids = self._error_rows()
+        paths = [Path(self.error_case_by_id[row_id]) for row_id in row_ids if row_id in self.error_case_by_id]
+        if not paths:
+            self._log("신고할 오류 로그가 없습니다. 목록에 오류 상태인 항목이 있는지 확인해주세요.")
+            return
+
+        self._log(f"기훈이한테 이를 오류 {len(paths)}건을 GitHub 이슈로 업로드합니다.")
+        threading.Thread(target=self._issue_report_worker, args=(paths,), daemon=True).start()
+
+    def _error_rows(self) -> list[str]:
+        return [
+            row_id
+            for row_id in self.tree.get_children()
+            if self._row_status(row_id) in ERROR_STATUSES
+        ]
+
+    def _issue_report_worker(self, paths: list[Path]) -> None:
+        try:
+            result = report_error_cases(paths, self.run_summary or self.last_checkpoint)
+            self.events.put(("log", result.message))
+            if result.url:
+                self.events.put(("log", f"이슈 링크: {result.url}"))
+            self.events.put(("status", "이슈 등록 완료" if result.created else "이슈 작성창 열림"))
+        except Exception as exc:  # noqa: BLE001 - keep GUI alive if reporting fails.
+            self.events.put(("status", "이슈 등록 오류"))
+            self.events.put(("log", f"기훈이한테 이르기 실패: {exc}"))
+
     def _row_status(self, row_id: str) -> str:
         if not self.tree.exists(row_id):
             return ""
@@ -631,7 +665,8 @@ class DownloaderApp:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep draining retry queue.
                 failed_count += 1
-                self.events.put(("item_status", row_id, "오류"))
+                category = self._save_error_case(row_id, item, "재다운로드", exc)
+                self.events.put(("item_status", row_id, category))
                 self.events.put(("log", f"재다운로드 실패 - 건너뜀: {item.display_title} / {exc}"))
             finally:
                 with self.retry_lock:
@@ -649,10 +684,12 @@ class DownloaderApp:
         detail = self._get_media_for_retry(client, item)
 
         if detail.country_code and detail.country_code != "410":
+            self._record_session("한국 아님", "재다운로드", detail, "한국 광고가 아니어서 제외")
             self.events.put(("item_status", row_id, "한국 아님"))
             self.events.put(("log", f"재다운로드 제외: 한국 광고가 아닙니다 / {label}"))
             return
         if detail.category_code and detail.category_code != "1":
+            self._record_session("광고 아님", "재다운로드", detail, "광고 카테고리가 아니어서 제외")
             self.events.put(("item_status", row_id, "광고 아님"))
             self.events.put(("log", f"재다운로드 제외: 광고 카테고리가 아닙니다 / {label}"))
             return
@@ -691,6 +728,7 @@ class DownloaderApp:
             )
 
         result_status = "재다운완료" if output.repaired else "완료"
+        self._record_session(result_status, "재다운로드", merged, output_path=str(output.path))
         self.events.put(("item_status", row_id, result_status))
         self.events.put(("log", f"재다운로드 저장 완료: {output.path}"))
 
@@ -719,6 +757,50 @@ class DownloaderApp:
 
         raise TVCFError("; ".join(errors) if errors else "상세 정보를 찾지 못했습니다.")
 
+    def _save_error_case(self, row_id: str, item: MediaItem | None, stage: str, exc: BaseException | str) -> str:
+        category = classify_error(stage, exc)
+        context = {
+            "run_summary": self.run_summary,
+            "last_checkpoint": self.last_checkpoint,
+            "download_dir": self.download_dir_var.get(),
+            "quality": self.quality_var.get(),
+            "date_basis": self.date_basis_var.get(),
+            "file_date": item.date_label(self.date_basis_var.get()) if item else "",
+        }
+        try:
+            error_path = save_error_case(item, stage, exc, context)
+            if row_id:
+                self.events.put(("error_case", row_id, str(error_path)))
+            self.events.put(("log", f"오류 로그 저장: {error_path}"))
+            self._record_session(category, stage, item, str(exc), error_path=str(error_path))
+        except Exception as save_exc:  # noqa: BLE001 - logging failure must not stop downloads.
+            self.events.put(("log", f"오류 로그 저장 실패: {save_exc}"))
+            self._record_session(category, stage, item, str(exc))
+        return category
+
+    def _record_session(
+        self,
+        status: str,
+        stage: str,
+        item: MediaItem | None = None,
+        message: str = "",
+        output_path: str = "",
+        error_path: str = "",
+    ) -> None:
+        if not self.session_log:
+            return
+        try:
+            self.session_log.add(
+                status=status,
+                stage=stage,
+                item=item,
+                message=message,
+                output_path=output_path,
+                error_path=error_path,
+            )
+        except OSError:
+            pass
+
     def preview(self) -> None:
         self._start_worker(download=False)
 
@@ -737,6 +819,7 @@ class DownloaderApp:
         self.stop_event.clear()
         self._save_current_config()
         self.run_summary = self._build_run_summary()
+        self.session_log = SessionLog(self.run_summary)
         self._set_checkpoint(f"작업 준비: {self.run_summary}")
         self._clear_items()
         self.progress.configure(value=0, maximum=1)
@@ -765,6 +848,7 @@ class DownloaderApp:
             self.events.put(("progress_max", max(1, len(items))))
             failed_count = 0
             for index, item in enumerate(items, start=1):
+                row_id = item.nidx or item.idx
                 if self.stop_event.is_set():
                     self.events.put(("status", "중단됨"))
                     self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
@@ -773,7 +857,7 @@ class DownloaderApp:
                 label = item.display_title
                 position = self._item_position_text(index, len(items), item)
                 self._checkpoint(f"{self.run_summary} / {position} 상세 확인 중 / {label}")
-                self.events.put(("item_status", item.nidx or item.idx, "상세 확인"))
+                self.events.put(("item_status", row_id, "상세 확인"))
                 self.events.put(("log", f"[{index}/{len(items)}] {label}"))
 
                 try:
@@ -784,23 +868,26 @@ class DownloaderApp:
                     )
                 except Exception as exc:  # noqa: BLE001 - keep batch moving after one bad page.
                     failed_count += 1
-                    self.events.put(("item_status", item.nidx or item.idx, "오류"))
+                    category = self._save_error_case(row_id, item, "상세 확인", exc)
+                    self.events.put(("item_status", row_id, category))
                     self.events.put(("log", f"상세 확인 오류 - 건너뜀: {label} / {exc}"))
                     self.events.put(("progress", index))
                     continue
 
                 if detail.country_code and detail.country_code != "410":
-                    self.events.put(("item_status", item.nidx or item.idx, "한국 아님"))
+                    self._record_session("한국 아님", "상세 확인", detail, "한국 광고가 아니어서 제외")
+                    self.events.put(("item_status", row_id, "한국 아님"))
                     self.events.put(("progress", index))
                     continue
                 if detail.category_code and detail.category_code != "1":
-                    self.events.put(("item_status", item.nidx or item.idx, "광고 아님"))
+                    self._record_session("광고 아님", "상세 확인", detail, "광고 카테고리가 아니어서 제외")
+                    self.events.put(("item_status", row_id, "광고 아님"))
                     self.events.put(("progress", index))
                     continue
 
                 merged = self._merge_item(item, detail)
                 self._checkpoint(f"{self.run_summary} / {position} 다운로드 중 / {merged.display_title}")
-                self.events.put(("item_status", item.nidx or item.idx, "다운로드"))
+                self.events.put(("item_status", row_id, "다운로드"))
                 try:
                     output = download_media(
                         merged,
@@ -812,19 +899,22 @@ class DownloaderApp:
                         should_stop=self.stop_event.is_set,
                     )
                 except DownloadCancelled:
-                    self.events.put(("item_status", item.nidx or item.idx, "중단됨"))
+                    self._record_session("중단됨", "다운로드", merged, "사용자 중단")
+                    self.events.put(("item_status", row_id, "중단됨"))
                     self.events.put(("status", "중단됨"))
                     self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
                     return
                 except Exception as exc:  # noqa: BLE001 - skip failed item and continue.
                     failed_count += 1
-                    self.events.put(("item_status", item.nidx or item.idx, "오류"))
+                    category = self._save_error_case(row_id, merged, "다운로드", exc)
+                    self.events.put(("item_status", row_id, category))
                     self.events.put(("log", f"다운로드 오류 - 건너뜀: {merged.display_title} / {exc}"))
                     self.events.put(("progress", index))
                     continue
 
                 result_status = "건너뜀" if output.skipped else "재다운완료" if output.repaired else "완료"
-                self.events.put(("item_status", item.nidx or item.idx, result_status))
+                self._record_session(result_status, "다운로드", merged, output_path=str(output.path))
+                self.events.put(("item_status", row_id, result_status))
                 self.events.put(("log", f"저장 완료: {output.path}"))
                 self.events.put(("progress", index))
 
@@ -837,6 +927,7 @@ class DownloaderApp:
                 self.events.put(("status", "다운로드 완료"))
             self._checkpoint(f"작업 완료: {self.run_summary}")
         except Exception as exc:  # noqa: BLE001 - show GUI error.
+            self._save_error_case("", None, "전체 작업", exc)
             self.events.put(("status", "오류"))
             self.events.put(("log", f"오류: {exc}"))
             self.events.put(("log", f"마지막 작업: {self.last_checkpoint}"))
@@ -880,6 +971,7 @@ class DownloaderApp:
                 else:
                     self.events.put(("log", f"{identifier}: 한국 광고가 아니어서 제외"))
             except TVCFError as exc:
+                self._save_error_case(identifier, MediaItem(nidx=identifier), "ID 상세 확인", exc)
                 self.events.put(("log", f"{identifier}: {exc}"))
         return items
 
@@ -954,6 +1046,8 @@ class DownloaderApp:
             self._set_progress_text(current, maximum)
         elif kind == "checkpoint":
             self._set_checkpoint(event[1])
+        elif kind == "error_case":
+            self.error_case_by_id[event[1]] = event[2]
 
     def _show_items(self, items: list[MediaItem]) -> None:
         self._clear_tree()
@@ -996,6 +1090,7 @@ class DownloaderApp:
         self.items = []
         self.item_by_id = {}
         self.checked_rows.clear()
+        self.error_case_by_id.clear()
         with self.retry_lock:
             self.retry_queue.clear()
             self.queued_retry_rows.clear()
@@ -1072,7 +1167,7 @@ class DownloaderApp:
             return "active"
         if status in {"한국 아님", "광고 아님", "대기열에 다시 추가됨"}:
             return "warning"
-        if status in {"중단됨", "오류"}:
+        if status in ERROR_STATUSES or status == "중단됨":
             return "error"
         return ""
 

@@ -7,6 +7,7 @@ __pycache__/
 
 config.json
 downloads/
+logs/
 *.zip
 
 bin/

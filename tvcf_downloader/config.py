@@ -13,6 +13,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "max_pages": 0,
     "prefer_ytdlp": True,
     "use_playwright_fallback": True,
+    "github_issue_token": "",
     "last_checkpoint": "작업 없음",
 }
 
@@ -21,7 +22,7 @@ def load_config() -> Dict[str, Any]:
     config = dict(DEFAULT_CONFIG)
     if CONFIG_PATH.exists():
         try:
-            saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+            saved = json.loads(CONFIG_PATH.read_text(encoding="utf-8-sig"))
             if isinstance(saved, dict):
                 config.update(saved)
         except (OSError, json.JSONDecodeError):

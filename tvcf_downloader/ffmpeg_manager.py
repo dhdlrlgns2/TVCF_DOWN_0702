@@ -4,6 +4,7 @@ import shutil
 import subprocess
 import tempfile
 import zipfile
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional
 from urllib.request import Request, urlopen
@@ -18,23 +19,50 @@ BIN_DIR = PROJECT_ROOT / "bin"
 FFMPEG_EXE = BIN_DIR / "ffmpeg.exe"
 FFPROBE_EXE = BIN_DIR / "ffprobe.exe"
 MANIFEST_PATH = BIN_DIR / "ffmpeg_manifest.json"
+FFMPEG_UPDATE_DAYS = 7
 
 
 class FFmpegInstallError(RuntimeError):
     pass
 
 
-def ensure_ffmpeg(log: LogCallback = None) -> str:
+def ensure_ffmpeg(log: LogCallback = None, check_latest: bool = False, max_age_days: int = FFMPEG_UPDATE_DAYS) -> str:
     if FFMPEG_EXE.exists():
         version = ffmpeg_version(FFMPEG_EXE)
-        if log and version:
-            log(f"ffmpeg 확인: {version}")
+        if not check_latest or _manifest_is_fresh(MANIFEST_PATH, max_age_days):
+            if log and version:
+                log(f"ffmpeg 확인: {version}")
+            return str(FFMPEG_EXE)
+
+        try:
+            asset = get_latest_windows_asset()
+        except Exception as exc:  # noqa: BLE001 - keep existing ffmpeg if release lookup fails.
+            if log:
+                log(f"ffmpeg 최신 버전 확인 실패, 기존 파일을 계속 사용합니다: {exc}")
+            return str(FFMPEG_EXE)
+
+        manifest = _read_manifest()
+        current_asset_name = manifest.get("asset", {}).get("name", "")
+        if current_asset_name == asset.get("name"):
+            _write_manifest(asset, version, checked_only=True)
+            if log and version:
+                log(f"ffmpeg 최신 상태: {version}")
+            return str(FFMPEG_EXE)
+
+        if log:
+            log(f"ffmpeg 업데이트를 다운로드합니다: {asset['name']}")
+        _install_ffmpeg_asset(asset, log=log)
         return str(FFMPEG_EXE)
 
     asset = get_latest_windows_asset()
     if log:
         log(f"ffmpeg가 없어 최신 빌드를 다운로드합니다: {asset['name']}")
 
+    _install_ffmpeg_asset(asset, log=log)
+    return str(FFMPEG_EXE)
+
+
+def _install_ffmpeg_asset(asset: dict, log: LogCallback = None) -> None:
     BIN_DIR.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="tvcf_ffmpeg_") as temp_dir:
         temp_path = Path(temp_dir)
@@ -60,12 +88,13 @@ def ensure_ffmpeg(log: LogCallback = None) -> str:
         "release_api": GITHUB_RELEASE_API,
         "asset": asset,
         "version": version,
+        "installed_at": datetime.now().isoformat(timespec="seconds"),
+        "checked_at": datetime.now().isoformat(timespec="seconds"),
     }
     MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
 
     if log:
         log(f"ffmpeg 설치 완료: {version or FFMPEG_EXE}")
-    return str(FFMPEG_EXE)
 
 
 def get_latest_windows_asset() -> dict:
@@ -149,3 +178,38 @@ def _version_tuple(asset_name: str) -> tuple:
     if not match:
         return (0,)
     return tuple(int(part) for part in match.group(1).split("."))
+
+
+def _read_manifest() -> dict:
+    try:
+        return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _write_manifest(asset: dict, version: str, checked_only: bool = False) -> None:
+    manifest = _read_manifest()
+    if not checked_only:
+        manifest["installed_at"] = datetime.now().isoformat(timespec="seconds")
+    manifest.update(
+        {
+            "source": "BtbN/FFmpeg-Builds",
+            "release_api": GITHUB_RELEASE_API,
+            "asset": asset,
+            "version": version,
+            "checked_at": datetime.now().isoformat(timespec="seconds"),
+        }
+    )
+    MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _manifest_is_fresh(path: Path, max_age_days: int) -> bool:
+    if max_age_days <= 0 or not path.exists():
+        return False
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        checked_at = manifest.get("checked_at") or manifest.get("installed_at")
+        checked = datetime.fromisoformat(checked_at)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return datetime.now() - checked < timedelta(days=max_age_days)

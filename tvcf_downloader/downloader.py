@@ -1,9 +1,11 @@
+import json
 import os
 import re
 import shutil
 import subprocess
 import sys
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Callable, Optional, Sequence
 from urllib.request import Request, urlopen
@@ -36,7 +38,9 @@ class DownloadResult:
 
 
 YTDLP_EXE = PROJECT_ROOT / "bin" / "yt-dlp.exe"
+YTDLP_MANIFEST_PATH = PROJECT_ROOT / "bin" / "yt-dlp_manifest.json"
 YTDLP_DOWNLOAD_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
+YTDLP_UPDATE_DAYS = 7
 
 
 def clean_filename(text: str, max_length: int = 120) -> str:
@@ -182,6 +186,26 @@ def resolve_ytdlp(log: LogCallback = None) -> Sequence[str]:
         return _download_ytdlp(log)
 
     return [sys.executable, "-m", "yt_dlp"]
+
+
+def ensure_ytdlp(log: LogCallback = None, max_age_days: int = YTDLP_UPDATE_DAYS) -> Sequence[str]:
+    if not YTDLP_EXE.exists():
+        return _download_ytdlp(log)
+
+    if _manifest_is_fresh(YTDLP_MANIFEST_PATH, max_age_days):
+        if log:
+            version = ytdlp_version([str(YTDLP_EXE)])
+            safe_log(log, f"yt-dlp 확인: {version or YTDLP_EXE}")
+        return [str(YTDLP_EXE)]
+
+    if log:
+        safe_log(log, "yt-dlp 최신 버전을 확인합니다.")
+    try:
+        return _download_ytdlp(log)
+    except DownloadError as exc:
+        if log:
+            safe_log(log, f"yt-dlp 업데이트 실패, 기존 파일을 계속 사용합니다: {exc}")
+        return [str(YTDLP_EXE)]
 
 
 def download_media(
@@ -376,15 +400,60 @@ def _download_ytdlp(log: LogCallback = None) -> Sequence[str]:
     if log:
         safe_log(log, "yt-dlp가 없어 자동으로 다운로드합니다.")
 
+    temp_path = YTDLP_EXE.with_suffix(".exe.tmp")
     request = Request(YTDLP_DOWNLOAD_URL, headers={"User-Agent": "TVCF-Downloader"})
     try:
-        with urlopen(request, timeout=60) as response, YTDLP_EXE.open("wb") as output:
+        with urlopen(request, timeout=60) as response, temp_path.open("wb") as output:
             shutil.copyfileobj(response, output)
+        temp_path.replace(YTDLP_EXE)
     except Exception as exc:  # noqa: BLE001 - surface a clear downloader error.
-        if YTDLP_EXE.exists():
-            YTDLP_EXE.unlink()
+        if temp_path.exists():
+            temp_path.unlink()
         raise DownloadError(f"yt-dlp 자동 다운로드 실패: {exc}") from exc
 
+    version = ytdlp_version([str(YTDLP_EXE)])
+    YTDLP_MANIFEST_PATH.write_text(
+        json.dumps(
+            {
+                "source": "yt-dlp/yt-dlp",
+                "download_url": YTDLP_DOWNLOAD_URL,
+                "installed_at": datetime.now().isoformat(timespec="seconds"),
+                "checked_at": datetime.now().isoformat(timespec="seconds"),
+                "version": version,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
     if log:
-        safe_log(log, f"yt-dlp 설치 완료: {YTDLP_EXE}")
+        safe_log(log, f"yt-dlp 설치 완료: {version or YTDLP_EXE}")
     return [str(YTDLP_EXE)]
+
+
+def ytdlp_version(cmd: Sequence[str]) -> str:
+    try:
+        process = subprocess.run(
+            [*cmd, "--version"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=True,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    return process.stdout.strip()
+
+
+def _manifest_is_fresh(path: Path, max_age_days: int) -> bool:
+    if max_age_days <= 0 or not path.exists():
+        return False
+    try:
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        checked_at = manifest.get("checked_at") or manifest.get("installed_at")
+        checked = datetime.fromisoformat(checked_at)
+    except (OSError, json.JSONDecodeError, TypeError, ValueError):
+        return False
+    return datetime.now() - checked < timedelta(days=max_age_days)
