@@ -6,11 +6,12 @@ from pathlib import Path
 from typing import Iterable
 from urllib.request import Request, urlopen
 
-from .config import load_config
+from .config import PROJECT_ROOT
 from .diagnostics import read_error_case
 
 
 ISSUES_API_URL = "https://api.github.com/repos/dhdlrlgns2/TVCF_DOWN_0702/issues"
+TOKEN_PATH = PROJECT_ROOT / "github_issue_token.json"
 BODY_LIMIT = 60000
 
 
@@ -32,7 +33,10 @@ def report_error_cases(error_paths: Iterable[Path], run_summary: str = "") -> Is
 
     token = _github_token()
     if not token:
-        raise RuntimeError("GitHub 이슈 토큰이 없습니다. config.json의 github_issue_token 또는 TVCF_GITHUB_TOKEN을 설정해주세요.")
+        raise RuntimeError(
+            "GitHub 이슈 토큰이 없습니다. github_issue_token.json 파일이나 "
+            "TVCF_GITHUB_TOKEN 환경변수를 설정해주세요."
+        )
 
     url = _create_issue(title, body, token)
     return IssueReportResult(True, url, f"GitHub 이슈를 생성했습니다: {url}")
@@ -97,6 +101,18 @@ def _github_token() -> str:
     token = os.environ.get("TVCF_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
     if token:
         return token
-    config = load_config()
-    value = config.get("github_issue_token", "")
-    return str(value).strip()
+    try:
+        data = json.loads(TOKEN_PATH.read_text(encoding="utf-8-sig"))
+    except (OSError, json.JSONDecodeError):
+        return ""
+
+    if isinstance(data, str):
+        return data.strip()
+    if not isinstance(data, dict):
+        return ""
+
+    for key in ("token", "github_issue_token", "github_token"):
+        value = data.get(key, "")
+        if value:
+            return str(value).strip()
+    return ""

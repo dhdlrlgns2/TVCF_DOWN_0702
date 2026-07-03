@@ -6,6 +6,7 @@ __pycache__/
 *.pyd
 
 config.json
+github_issue_token.json
 downloads/
 logs/
 *.zip

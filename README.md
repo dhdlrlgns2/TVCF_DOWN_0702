@@ -98,4 +98,14 @@ GUI의 `작업 요약 / 중단 지점`에는 마지막 실행 조건과 현재 �
 
 GUI의 `기훈이한테 이르기` 버튼은 현재 다운로드 목록에서 오류 상태인 항목 전체를 모아 GitHub 이슈 하나로 업로드합니다. 이슈 본문은 추후 분석하기 쉽도록 원본 오류 JSON 중심으로 저장됩니다.
 
-자동 이슈 업로드에는 `config.json`의 `github_issue_token` 또는 환경변수 `TVCF_GITHUB_TOKEN` / `GITHUB_TOKEN`이 필요합니다. `config.json`은 GitHub에 업로드되지 않습니다.
+자동 이슈 업로드에는 프로젝트 폴더의 `github_issue_token.json` 또는 환경변수 `TVCF_GITHUB_TOKEN` / `GITHUB_TOKEN`이 필요합니다. `github_issue_token.example.json`을 참고해 `github_issue_token.json`을 만들면 됩니다.
+
+`github_issue_token.json` 예시:
+
+```json
+{
+  "token": "GitHub fine-grained token with issue read/write permission"
+}
+```
+
+`github_issue_token.json`은 GitHub에 업로드되지 않습니다.
