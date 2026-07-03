@@ -1,4 +1,5 @@
 .venv/
+.update_backups/
 __pycache__/
 *.pyc
 *.pyo

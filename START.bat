@@ -2,6 +2,10 @@
 setlocal EnableExtensions
 cd /d "%~dp0"
 
+echo ========================================
+echo TVCF Downloader START
+echo ========================================
+
 set "PYTHON_CMD="
 where py >nul 2>nul
 if not errorlevel 1 (
@@ -13,23 +17,24 @@ if not errorlevel 1 (
 
 if not defined PYTHON_CMD (
   echo [ERROR] Python was not found.
-  echo Please install Python 3.10 or newer, then run this file again.
+  echo Please install Python 3.10 or newer, then run START.bat again.
   pause
   exit /b 1
 )
 
-echo [UPDATE] Checking for app updates...
+echo [STEP 1] Checking app update from git...
 %PYTHON_CMD% -m tvcf_downloader.updater
 set "UPDATE_CODE=%ERRORLEVEL%"
 if "%UPDATE_CODE%"=="2" (
-  echo [UPDATE] Restarting launcher after update...
+  echo [UPDATE] Restarting START.bat after update...
   call "%~f0"
   exit /b %ERRORLEVEL%
 )
 if not "%UPDATE_CODE%"=="0" (
-  echo [WARNING] Update check failed. Starting current version.
+  echo [WARNING] Update check failed. Continuing with current files.
 )
 
+echo [STEP 2] Checking Python virtual environment...
 if not exist ".venv\Scripts\python.exe" (
   echo [SETUP] Creating local Python virtual environment...
   %PYTHON_CMD% -m venv .venv
@@ -42,7 +47,7 @@ if not exist ".venv\Scripts\python.exe" (
 
 set "VENV_PY=%CD%\.venv\Scripts\python.exe"
 
-echo [SETUP] Installing required Python packages...
+echo [STEP 3] Installing or checking Python packages...
 "%VENV_PY%" -m pip install --disable-pip-version-check -r requirements.txt
 if errorlevel 1 (
   echo [ERROR] Failed to install Python packages.
@@ -51,6 +56,7 @@ if errorlevel 1 (
   exit /b 1
 )
 
+echo [STEP 4] Checking Playwright Chromium...
 if not exist ".venv\.playwright_chromium_installed" (
   echo [SETUP] Installing Playwright Chromium browser...
   "%VENV_PY%" -m playwright install chromium
@@ -62,7 +68,15 @@ if not exist ".venv\.playwright_chromium_installed" (
   )
 )
 
-echo [START] Launching TVCF downloader...
+echo [STEP 5] Checking bin tools...
+"%VENV_PY%" -m tvcf_downloader.environment
+if errorlevel 1 (
+  echo [ERROR] Required bin tools could not be prepared.
+  pause
+  exit /b 1
+)
+
+echo [STEP 6] Launching GUI...
 "%VENV_PY%" main.py
 if errorlevel 1 (
   echo [ERROR] The app exited with an error.

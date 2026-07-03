@@ -1,14 +1,29 @@
 import subprocess
 import sys
+from datetime import datetime
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+REPO_URL = "https://github.com/dhdlrlgns2/TVCF_DOWN_0702.git"
+BRANCH = "main"
 
 
 def run_git(args: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
     return subprocess.run(
         ["git", "-C", str(PROJECT_ROOT), *args],
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        check=check,
+    )
+
+
+def run_git_global(args: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        ["git", *args],
+        cwd=str(PROJECT_ROOT),
         capture_output=True,
         text=True,
         encoding="utf-8",
@@ -39,6 +54,63 @@ def is_git_checkout() -> bool:
     return result.returncode == 0 and result.stdout.strip() == "true"
 
 
+def ensure_origin() -> None:
+    result = run_git(["remote", "get-url", "origin"])
+    if result.returncode == 0:
+        current = result.stdout.strip()
+        if current != REPO_URL:
+            run_git(["remote", "set-url", "origin", REPO_URL])
+        return
+    run_git(["remote", "add", "origin", REPO_URL])
+
+
+def bootstrap_git_checkout() -> int:
+    print("[UPDATE] This folder is not a git checkout. Preparing repository...")
+    init = run_git_global(["init", "-b", BRANCH])
+    if init.returncode != 0:
+        print("[UPDATE] Git init failed. Starting current files.")
+        if init.stderr.strip():
+            print(init.stderr.strip())
+        return 0
+
+    ensure_origin()
+    fetch = run_git(["fetch", "--quiet", "origin", BRANCH])
+    if fetch.returncode != 0:
+        print("[UPDATE] Fetch failed. Starting current files.")
+        if fetch.stderr.strip():
+            print(fetch.stderr.strip())
+        return 0
+
+    backup_tracked_files()
+    checkout = run_git(["checkout", "-B", BRANCH, f"origin/{BRANCH}", "--force"])
+    if checkout.returncode != 0:
+        print("[UPDATE] Checkout failed. Starting current files.")
+        if checkout.stderr.strip():
+            print(checkout.stderr.strip())
+        return 0
+
+    run_git(["branch", "--set-upstream-to", f"origin/{BRANCH}", BRANCH])
+    print("[UPDATE] Repository prepared from remote.")
+    return 2
+
+
+def backup_tracked_files() -> None:
+    result = run_git(["ls-tree", "-r", "--name-only", f"origin/{BRANCH}"])
+    if result.returncode != 0:
+        return
+
+    files = [line.strip() for line in result.stdout.splitlines() if line.strip()]
+    existing_files = [PROJECT_ROOT / name for name in files if (PROJECT_ROOT / name).is_file()]
+    if not existing_files:
+        return
+
+    backup_root = PROJECT_ROOT / ".update_backups" / datetime.now().strftime("%Y%m%d_%H%M%S")
+    for source in existing_files:
+        destination = backup_root / source.relative_to(PROJECT_ROOT)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(source.read_bytes())
+
+
 def has_tracked_local_changes() -> bool:
     run_git(["update-index", "-q", "--refresh"])
     result = run_git(["diff-index", "--quiet", "HEAD", "--"])
@@ -66,13 +138,18 @@ def check_and_update() -> int:
         return 0
 
     if not is_git_checkout():
-        print("[UPDATE] This folder is not a git checkout. Skipping update check.")
-        return 0
+        return bootstrap_git_checkout()
+
+    ensure_origin()
 
     upstream = upstream_ref()
     if not upstream:
-        print("[UPDATE] No upstream branch is configured. Skipping update check.")
-        return 0
+        run_git(["fetch", "--quiet", "origin", BRANCH])
+        run_git(["branch", "--set-upstream-to", f"origin/{BRANCH}", BRANCH])
+        upstream = upstream_ref()
+        if not upstream:
+            print("[UPDATE] No upstream branch is configured. Skipping update check.")
+            return 0
 
     if has_tracked_local_changes():
         print("[UPDATE] Local code changes detected. Skipping auto update.")

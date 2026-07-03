@@ -6,25 +6,27 @@ TVCF 목록에서 한국 광고(`country_code=410`, `category_code=1`)만 찾아
 
 Python 3.10 이상을 권장합니다.
 
-압축을 푼 뒤 `run_gui.bat`을 실행하면 됩니다.
+압축을 푼 뒤 `START.bat`을 실행하면 됩니다.
 
-`run_gui.bat`은 처음 실행할 때 자동으로 다음 작업을 처리합니다.
+`START.bat`은 실행할 때마다 자동으로 다음 작업을 처리합니다.
 
-- Git 저장소로 받은 경우 업데이트 확인 및 자동 적용
+- Git 최신 버전 확인 및 자동 적용
+- `.git`이 없는 폴더라면 Git 저장소 연결 및 최신 파일 가져오기
 - `.venv` 가상환경 생성
 - `pip install -r requirements.txt` 실행
 - Playwright Chromium 브라우저 설치
+- `bin` 폴더의 `ffmpeg.exe`, `ffprobe.exe`, `yt-dlp.exe` 확인 및 자동 준비
 - GUI 실행
 
 다음 실행부터는 설치된 환경을 재사용합니다. Python이 설치되어 있지 않은 PC에서는 Python 3.10 이상을 먼저 설치해야 합니다.
 
 ## 자동 업데이트
 
-이 폴더가 `git clone`으로 받은 Git 저장소이고 upstream branch가 설정되어 있으면, `run_gui.bat` 실행 시 자동으로 `git fetch` 후 업데이트가 있는지 확인합니다.
+`START.bat` 실행 시 자동으로 `git fetch` 후 업데이트가 있는지 확인합니다.
 
 - 업데이트가 있으면 `git pull --ff-only`로 자동 적용합니다.
 - 로컬 코드 수정이 있으면 덮어쓰지 않고 자동 업데이트를 건너뜁니다.
-- zip으로 받은 폴더처럼 `.git` 정보가 없으면 업데이트 체크를 건너뜁니다.
+- zip으로 받은 폴더처럼 `.git` 정보가 없으면 Git 저장소를 연결하고 최신 파일을 가져옵니다. 기존 코드 파일은 `.update_backups` 폴더에 백업됩니다.
 - 업데이트 후 `requirements.txt`가 바뀌어도 이어서 패키지 설치 확인을 다시 실행합니다.
 
 ## 동작 방식
