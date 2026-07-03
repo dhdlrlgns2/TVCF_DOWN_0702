@@ -15,7 +15,7 @@ Python 3.10 이상을 권장합니다.
 - Git 최신 버전 확인 및 자동 적용
 - `.git`이 없는 폴더라면 Git 저장소 연결 및 최신 파일 가져오기
 - `.venv` 가상환경 생성
-- `pip install -r requirements.txt` 실행
+- `requirements.txt`가 바뀐 경우에만 `pip install -r requirements.txt` 실행
 - Playwright Chromium 브라우저 설치
 - `bin` 폴더의 `ffmpeg.exe`, `ffprobe.exe`, `yt-dlp.exe` 확인 및 자동 준비
 - GUI 실행
@@ -37,9 +37,10 @@ Python 3.10 이상을 권장합니다.
 
 1. 기간 모드에서는 선택한 기준에 맞춰 TVCF 영상 목록을 읽습니다. `published`는 공개일 순, `registered`는 TVCF 등록일 순입니다.
 2. 결과에서 한국 광고만 로컬에서 필터링합니다.
-3. 상세 페이지의 Next.js 초기 데이터에서 HD/SD/mobile `.m3u8` 스트림을 먼저 찾습니다.
-4. 스트림이 없으면 Playwright 네트워크 감시로 `.m3u8`을 다시 찾습니다.
-5. 다운로드는 `yt-dlp`를 먼저 사용하고, 실패하거나 없으면 `ffmpeg`를 사용합니다.
+3. 목록은 Next.js Flight 데이터의 `results` JSON 배열을 우선 구조적으로 파싱하고, 실패하면 기존 레거시 파서로 한 번 더 시도합니다.
+4. 상세 페이지의 Next.js 초기 데이터에서 HD/SD/mobile `.m3u8` 스트림을 먼저 찾습니다.
+5. 스트림이 없으면 Playwright 네트워크 감시로 `.m3u8`을 다시 찾습니다.
+6. 다운로드는 `yt-dlp`를 먼저 사용하고, 실패하거나 없으면 `ffmpeg`를 사용합니다. `ffmpeg`에는 HTTP 재연결 옵션을 넣어 중간 네트워크 끊김에 더 강하게 처리합니다.
 
 ## 저장 경로 유지
 

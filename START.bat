@@ -83,12 +83,19 @@ if not exist ".venv\Scripts\python.exe" (
 set "VENV_PY=%CD%\.venv\Scripts\python.exe"
 
 echo [STEP 3] Installing or checking Python packages...
-"%VENV_PY%" -m pip install --disable-pip-version-check -r requirements.txt
+"%VENV_PY%" -c "from pathlib import Path; import hashlib, sys; req=Path('requirements.txt'); marker=Path('.venv/requirements.sha256'); h=hashlib.sha256(req.read_bytes()).hexdigest(); sys.exit(0 if marker.exists() and marker.read_text(encoding='utf-8').strip()==h else 1)"
 if errorlevel 1 (
-  echo [ERROR] Failed to install Python packages.
-  echo Please check your internet connection and Python installation.
-  pause
-  exit /b 1
+  echo [SETUP] Python package requirements changed. Installing packages...
+  "%VENV_PY%" -m pip install --disable-pip-version-check -r requirements.txt
+  if errorlevel 1 (
+    echo [ERROR] Failed to install Python packages.
+    echo Please check your internet connection and Python installation.
+    pause
+    exit /b 1
+  )
+  "%VENV_PY%" -c "from pathlib import Path; import hashlib; req=Path('requirements.txt'); marker=Path('.venv/requirements.sha256'); marker.write_text(hashlib.sha256(req.read_bytes()).hexdigest(), encoding='utf-8')"
+) else (
+  echo [CHECK] Python packages are already current.
 )
 
 echo [STEP 4] Checking Playwright Chromium...

@@ -4,7 +4,7 @@ import time
 from datetime import date
 from http.client import IncompleteRead
 from html import unescape
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 from urllib.error import URLError
 from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
@@ -163,6 +163,10 @@ class TVCFClient:
         raise TVCFError("; ".join(errors) if errors else "미디어를 찾지 못했습니다.")
 
     def parse_list_page(self, html: str) -> List[MediaItem]:
+        structured_items = self._items_from_next_flight(html)
+        if structured_items:
+            return structured_items
+
         items: List[MediaItem] = []
         seen = set()
 
@@ -175,6 +179,110 @@ class TVCFClient:
                 seen.add(key)
 
         return items
+
+    def _items_from_next_flight(self, html: str) -> List[MediaItem]:
+        items: List[MediaItem] = []
+        seen = set()
+        for record in self._list_records_from_next_flight(html):
+            item = self._item_from_list_record(record)
+            key = item.nidx or item.idx or item.mcode
+            if key and key not in seen:
+                items.append(item)
+                seen.add(key)
+        return items
+
+    def _list_records_from_next_flight(self, html: str) -> Iterable[dict[str, Any]]:
+        flight_text = "".join(self._next_flight_strings(html))
+        if not flight_text:
+            return []
+
+        records: list[dict[str, Any]] = []
+        for match in re.finditer(r'"results"\s*:\s*\[', flight_text):
+            start = flight_text.find("[", match.start())
+            array_text = self._balanced_json_slice(flight_text, start, "[", "]")
+            if not array_text:
+                continue
+            try:
+                value = json.loads(array_text)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(value, list):
+                records.extend(record for record in value if isinstance(record, dict))
+        return records
+
+    @classmethod
+    def _next_flight_strings(cls, html: str) -> Iterable[str]:
+        marker = "self.__next_f.push("
+        position = 0
+        while True:
+            start = html.find(marker, position)
+            if start < 0:
+                break
+            argument_start = start + len(marker)
+            argument, position = cls._next_call_argument(html, argument_start)
+            if not argument:
+                break
+            try:
+                payload = json.loads(argument)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(payload, list) and len(payload) > 1 and isinstance(payload[1], str):
+                yield payload[1]
+
+    @staticmethod
+    def _next_call_argument(text: str, start: int) -> tuple[str, int]:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char in "[{":
+                depth += 1
+            elif char in "]}":
+                depth -= 1
+            elif char == ")" and depth == 0:
+                return text[start:index], index + 1
+        return "", len(text)
+
+    @staticmethod
+    def _balanced_json_slice(text: str, start: int, open_char: str, close_char: str) -> str:
+        if start < 0 or start >= len(text) or text[start] != open_char:
+            return ""
+
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+
+            if char == '"':
+                in_string = True
+            elif char == open_char:
+                depth += 1
+            elif char == close_char:
+                depth -= 1
+                if depth == 0:
+                    return text[start : index + 1]
+        return ""
 
     def parse_play_page(self, html: str, page_url: str) -> MediaItem:
         initial = self._slice_after(html, r'\\"initialData\\":{', 40000)
@@ -287,6 +395,51 @@ class TVCFClient:
             play_url=urljoin(self.BASE_URL, f"/play/{nidx}") if nidx else "",
             source_page=urljoin(self.BASE_URL, f"/play/{nidx}") if nidx else "",
         )
+
+    def _item_from_list_record(self, record: dict[str, Any]) -> MediaItem:
+        category_code = self._string_value(self._first_value(record.get("category_code")))
+        country_code = self._string_value(record.get("country_code"))
+        nidx = self._string_value(record.get("nidx"))
+
+        return MediaItem(
+            idx=self._string_value(record.get("idx")),
+            nidx=nidx,
+            mcode=self._string_value(record.get("mcode")),
+            title=self._string_value(record.get("title")),
+            chapter=self._string_value(record.get("chapter")),
+            brand=self._string_value(self._first_value(record.get("brand"))),
+            published_date=self._string_value(record.get("published_date")),
+            registered_date=self._string_value(record.get("registrated_date")),
+            country_code=country_code,
+            category_code=category_code,
+            category_name=self._string_value(record.get("category_code_name")),
+            duration=self._float_value(record.get("duration")),
+            play_url=urljoin(self.BASE_URL, f"/play/{nidx}") if nidx else "",
+            source_page=urljoin(self.BASE_URL, f"/play/{nidx}") if nidx else "",
+        )
+
+    @staticmethod
+    def _first_value(value: Any) -> Any:
+        if isinstance(value, list):
+            return value[0] if value else ""
+        return value
+
+    @staticmethod
+    def _string_value(value: Any) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        return str(value)
+
+    @staticmethod
+    def _float_value(value: Any) -> Optional[float]:
+        if value is None or value == "":
+            return None
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return None
 
     def _extract_streams(self, text: str) -> Dict[str, str]:
         streams: Dict[str, str] = {}
