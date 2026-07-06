@@ -106,8 +106,8 @@ class DownloaderApp:
     def __init__(self, root: Tk) -> None:
         self.root = root
         self.root.title("TVCF 한국 광고 다운로더")
-        self.root.geometry("1280x900")
-        self.root.minsize(1080, 760)
+        self.root.geometry("1680x940")
+        self.root.minsize(1280, 760)
         self.root.configure(bg=COLORS["bg"])
         self.root.option_add("*Font", "{Malgun Gothic} 10")
 
@@ -247,6 +247,8 @@ class DownloaderApp:
         self.style.map("Danger.TButton", background=[("active", "#fff8f8")], foreground=[("active", COLORS["danger"])])
         self.style.configure("Text.TButton", padding=(8, 4), background=COLORS["surface"], foreground=COLORS["muted"], bordercolor=COLORS["surface"])
         self.style.map("Text.TButton", background=[("active", "#f2f5fa")], foreground=[("active", COLORS["text"])])
+        self.style.configure("BlackText.TButton", padding=(8, 4), background=COLORS["surface"], foreground=COLORS["text"], bordercolor=COLORS["surface"])
+        self.style.map("BlackText.TButton", background=[("active", "#f2f5fa")], foreground=[("active", COLORS["text"])])
 
         self.style.configure("Badge.Idle.TLabel", font=medium_font, background=COLORS["accent_soft"], foreground=COLORS["accent"], padding=(14, 6))
         self.style.configure("Badge.Working.TLabel", font=medium_font, background=COLORS["accent_soft"], foreground=COLORS["accent"], padding=(14, 6))
@@ -288,18 +290,34 @@ class DownloaderApp:
         outer = ttk.Frame(self.root, padding=(14, 12), style="Main.TFrame")
         outer.pack(fill="both", expand=True)
         outer.columnconfigure(0, weight=1)
-        outer.rowconfigure(6, weight=3, minsize=150)
-        outer.rowconfigure(7, weight=2, minsize=130)
+        outer.rowconfigure(1, weight=1)
 
         self._build_header(outer)
-        self._build_path_card(outer)
-        self._build_target_card(outer)
-        self._build_options_card(outer)
-        self._build_actions(outer)
-        self._build_checkpoint_card(outer)
-        self._build_list_card(outer)
-        self._build_log_card(outer)
-        self._build_progress_card(outer)
+
+        content = ttk.Frame(outer, style="Main.TFrame")
+        content.grid(row=1, column=0, sticky="nsew")
+        content.columnconfigure(0, weight=1, minsize=900)
+        content.columnconfigure(1, weight=0, minsize=390)
+        content.rowconfigure(0, weight=1)
+
+        left = ttk.Frame(content, style="Main.TFrame")
+        left.grid(row=0, column=0, sticky="nsew")
+        left.columnconfigure(0, weight=1)
+        left.rowconfigure(6, weight=1, minsize=170)
+
+        right = ttk.Frame(content, style="Main.TFrame")
+        right.grid(row=0, column=1, sticky="nsew", padx=(10, 0))
+        right.columnconfigure(0, weight=1)
+        right.rowconfigure(0, weight=1)
+
+        self._build_path_card(left)
+        self._build_target_card(left)
+        self._build_options_card(left)
+        self._build_actions(left)
+        self._build_checkpoint_card(left)
+        self._build_list_card(left)
+        self._build_progress_card(left)
+        self._build_log_card(right, row=0)
 
         self.root.bind("<Configure>", self._sync_wraplength)
 
@@ -364,7 +382,12 @@ class DownloaderApp:
         ).grid(row=0, column=6, sticky="ew", pady=6)
 
     def _build_options_card(self, parent: ttk.Frame) -> None:
-        card = self._card(parent, row=3)
+        row = ttk.Frame(parent, style="Main.TFrame")
+        row.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        row.columnconfigure(0, weight=1)
+        row.columnconfigure(1, weight=1)
+
+        card = self._card(row, row=0, column=0, padx=(0, 5), pady=0)
         card.columnconfigure(0, weight=1)
 
         self._section_title(card, "다운로드 옵션", "gear").grid(row=0, column=0, sticky="w", padx=18, pady=(14, 4))
@@ -392,9 +415,11 @@ class DownloaderApp:
             style="Input.TCombobox",
         ).grid(row=0, column=3, sticky="w", padx=(0, 28))
 
-        self._section_title(card, "다운로드 완료 시 동작", "complete").grid(row=2, column=0, sticky="w", padx=18, pady=(0, 4))
-        completion = ttk.Frame(card, style="Surface.TFrame")
-        completion.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 14))
+        completion_card = self._card(row, row=0, column=1, padx=(5, 0), pady=0)
+        completion_card.columnconfigure(0, weight=1)
+        self._section_title(completion_card, "다운로드 완료 시 동작", "complete").grid(row=0, column=0, sticky="w", padx=18, pady=(14, 4))
+        completion = ttk.Frame(completion_card, style="Surface.TFrame")
+        completion.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 14))
         for idx in (1, 3, 5):
             completion.columnconfigure(idx, weight=1)
 
@@ -480,6 +505,12 @@ class DownloaderApp:
             row=0,
             column=3,
             sticky="e",
+            padx=(0, 8),
+        )
+        ttk.Button(header, text="지우기", command=self._clear_download_list, style="BlackText.TButton").grid(
+            row=0,
+            column=4,
+            sticky="e",
         )
 
         filter_bar = ttk.Frame(card, style="Surface.TFrame")
@@ -500,7 +531,6 @@ class DownloaderApp:
         search_entry = ttk.Entry(filter_bar, textvariable=self.search_var, style="Input.TEntry")
         search_entry.grid(row=0, column=3, sticky="ew")
         search_entry.bind("<KeyRelease>", lambda _event: self._render_tree())
-        self._icon_button(filter_bar, "지우기", self._clear_search, "stop", style="Text.TButton").grid(row=0, column=4, sticky="e", padx=(8, 0))
 
         table_wrap = ttk.Frame(card, style="Surface.TFrame")
         table_wrap.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 12))
@@ -520,9 +550,9 @@ class DownloaderApp:
         self.tree.heading("status", text="상태")
         self.tree.column("check", width=60, anchor="center", stretch=False)
         self.tree.column("date", width=110, anchor="center", stretch=False)
-        self.tree.column("title", width=670, anchor="w")
-        self.tree.column("id", width=170, anchor="center", stretch=False)
-        self.tree.column("status", width=170, anchor="center", stretch=False)
+        self.tree.column("title", width=430, anchor="w")
+        self.tree.column("id", width=150, anchor="center", stretch=False)
+        self.tree.column("status", width=130, anchor="center", stretch=False)
         self.tree.grid(row=0, column=0, sticky="nsew")
         self.tree.bind("<ButtonRelease-1>", self._on_tree_click)
 
@@ -538,8 +568,8 @@ class DownloaderApp:
         self.tree.tag_configure("warning", foreground=COLORS["warning"])
         self.tree.tag_configure("error", foreground=COLORS["danger"])
 
-    def _build_log_card(self, parent: ttk.Frame) -> None:
-        card = self._card(parent, row=7)
+    def _build_log_card(self, parent: ttk.Frame, row: int = 7) -> None:
+        card = self._card(parent, row=row, pady=0)
         card.columnconfigure(0, weight=1)
         card.rowconfigure(1, weight=1, minsize=100)
 
@@ -556,6 +586,7 @@ class DownloaderApp:
         self.log_text = ScrolledText(
             log_wrap,
             height=7,
+            width=38,
             wrap="word",
             relief="flat",
             borderwidth=0,
@@ -588,7 +619,14 @@ class DownloaderApp:
         ttk.Label(metrics, textvariable=self.eta_var, style="SurfaceMuted.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 18))
         ttk.Label(metrics, textvariable=self.summary_stats_var, style="SurfaceMuted.TLabel").grid(row=0, column=3, sticky="e")
 
-    def _card(self, parent: ttk.Frame, row: int) -> Frame:
+    def _card(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        column: int = 0,
+        padx: tuple[int, int] | int = 0,
+        pady: tuple[int, int] | int = (0, 10),
+    ) -> Frame:
         card = Frame(
             parent,
             bg=COLORS["surface"],
@@ -597,7 +635,7 @@ class DownloaderApp:
             highlightcolor=COLORS["border"],
             highlightthickness=1,
         )
-        card.grid(row=row, column=0, sticky="nsew", pady=(0, 10))
+        card.grid(row=row, column=column, sticky="nsew", padx=padx, pady=pady)
         return card
 
     def _load_icons(self) -> dict[str, PhotoImage]:
@@ -1332,7 +1370,7 @@ class DownloaderApp:
     def _refresh_row_stripes(self) -> None:
         self._render_tree()
 
-    def _clear_items(self) -> None:
+    def _clear_items(self, clear_log: bool = True) -> None:
         self.items = []
         self.item_by_id = {}
         self.row_records = {}
@@ -1343,7 +1381,25 @@ class DownloaderApp:
             self.retry_queue.clear()
             self.queued_retry_rows.clear()
         self._clear_tree()
-        self._clear_log()
+        if clear_log:
+            self._clear_log()
+
+    def _clear_download_list(self) -> None:
+        if self.worker and self.worker.is_alive():
+            self._log("작업 중에는 다운로드 목록을 지울 수 없습니다.")
+            return
+
+        self._clear_items(clear_log=False)
+        self.search_var.set("")
+        self.status_filter_var.set("전체")
+        self.progress.configure(value=0, maximum=1)
+        self.progress_text_var.set("0 / 0")
+        self.file_progress_var.set("현재 파일: 계산 중")
+        self.speed_var.set("속도: 계산 중")
+        self.eta_var.set("남은 시간: 계산 중")
+        self.summary_stats_var.set("완료 0 / 오류 0 / 건너뜀 0 / Playwright 0회")
+        self._set_checkpoint("다운로드 목록을 지웠습니다.")
+        self._log("다운로드 목록을 지웠습니다.")
 
     def _clear_tree(self) -> None:
         for item_id in self.tree.get_children():
@@ -1623,7 +1679,15 @@ class DownloaderApp:
     def _sync_wraplength(self, event: object | None = None) -> None:
         if not hasattr(self, "current_task_label"):
             return
-        width = max(480, self.root.winfo_width() - 140)
+        try:
+            if not self.current_task_label.winfo_exists():
+                return
+            container_width = self.current_task_label.master.winfo_width()
+        except Exception:  # noqa: BLE001 - resize callbacks can fire while the window is closing.
+            return
+        if container_width <= 1:
+            container_width = self.root.winfo_width() - 420
+        width = max(360, container_width - 32)
         self.current_task_label.configure(wraplength=width)
 
     def _build_run_summary(self) -> str:
