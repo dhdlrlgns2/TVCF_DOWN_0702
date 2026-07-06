@@ -103,6 +103,7 @@ SECTION_ICON_ALIASES = {
 MAX_GUI_EVENTS_PER_TICK = 80
 MAX_VISIBLE_LOG_LINES = 2000
 LOG_TRIM_LINES = 400
+MAX_LOG_MESSAGE_CHARS = 1200
 
 
 class DownloaderApp:
@@ -1515,6 +1516,8 @@ class DownloaderApp:
 
     def _log(self, message: str) -> None:
         message = decode_output(message)
+        if len(message) > MAX_LOG_MESSAGE_CHARS:
+            message = f"{message[:900]} ... [긴 로그 생략] ... {message[-200:]}"
         self._parse_download_metrics(message)
         if "Playwright fallback 사용" in message:
             self.playwright_fallback_count += 1

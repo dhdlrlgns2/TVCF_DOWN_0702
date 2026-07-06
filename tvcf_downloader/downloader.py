@@ -269,6 +269,8 @@ def download_media(
                 if log:
                     safe_log(log, "yt-dlp로 다운로드 시도")
                 _download_with_ytdlp(ytdlp_cmd, stream_url, output_path, item, ffmpeg, log, should_stop)
+                if log:
+                    safe_log(log, "다운로드 파일 검증 중")
                 verify_downloaded_file(output_path, ffprobe)
                 record_download(item, output_path, quality, "완료")
                 return DownloadResult(output_path, repaired=repaired)
@@ -293,6 +295,8 @@ def download_media(
                     suffix = "" if attempt == 1 else " (손상 파일 재시도)"
                     safe_log(log, f"ffmpeg로 다운로드 시도{suffix}")
                 _download_with_ffmpeg(ffmpeg, stream_url, output_path, item, log, should_stop)
+                if log:
+                    safe_log(log, "다운로드 파일 검증 중")
                 verify_downloaded_file(output_path, ffprobe)
                 record_download(item, output_path, quality, "완료")
                 return DownloadResult(output_path, repaired=repaired)
@@ -411,7 +415,23 @@ def _run_command(cmd: Sequence[str], log: LogCallback, should_stop: StopCallback
     assert process.stdout is not None
     last_progress_log = 0.0
     pending_progress_line = ""
-    for raw_line in process.stdout:
+
+    def process_line(raw_line: bytes) -> None:
+        nonlocal last_progress_log, pending_progress_line
+        line = decode_output(raw_line).strip()
+        if not line or not log:
+            return
+        if _is_progress_log_line(line):
+            now = time.monotonic()
+            if now - last_progress_log < 0.7:
+                pending_progress_line = line
+                return
+            last_progress_log = now
+            pending_progress_line = ""
+        safe_log(log, line)
+
+    pending_bytes = b""
+    while True:
         if should_stop and should_stop():
             process.terminate()
             try:
@@ -421,22 +441,38 @@ def _run_command(cmd: Sequence[str], log: LogCallback, should_stop: StopCallback
                 process.wait(timeout=5)
             raise DownloadCancelled("사용자 중단 요청으로 다운로드 명령을 종료했습니다.")
 
-        line = decode_output(raw_line).strip()
-        if line and log:
-            if _is_progress_log_line(line):
-                now = time.monotonic()
-                if now - last_progress_log < 0.7:
-                    pending_progress_line = line
-                    continue
-                last_progress_log = now
-                pending_progress_line = ""
-            safe_log(log, line)
+        chunk = process.stdout.read1(4096)
+        if not chunk:
+            break
+        pending_bytes += chunk
+        while True:
+            newline_index = _first_output_separator(pending_bytes)
+            if newline_index < 0:
+                break
+            raw_line = pending_bytes[:newline_index]
+            pending_bytes = pending_bytes[newline_index + 1 :]
+            if pending_bytes[:1] in {b"\r", b"\n"}:
+                pending_bytes = pending_bytes[1:]
+            process_line(raw_line)
+
+    if pending_bytes.strip():
+        process_line(pending_bytes)
 
     code = process.wait()
     if code == 0 and pending_progress_line and log:
         safe_log(log, pending_progress_line)
     if code != 0:
         raise DownloadError(f"명령 실행 실패(exit {code})")
+
+
+def _first_output_separator(data: bytes) -> int:
+    carriage = data.find(b"\r")
+    newline = data.find(b"\n")
+    if carriage < 0:
+        return newline
+    if newline < 0:
+        return carriage
+    return min(carriage, newline)
 
 
 def _is_progress_log_line(line: str) -> bool:
