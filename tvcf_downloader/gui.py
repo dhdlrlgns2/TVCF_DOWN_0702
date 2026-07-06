@@ -8,12 +8,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
-from tkinter import BooleanVar, Canvas, Frame, IntVar, StringVar, Tk, filedialog
+from tkinter import BooleanVar, Canvas, Frame, IntVar, PhotoImage, StringVar, Tk, filedialog
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from .client import TVCFClient, TVCFError
-from .config import load_config, save_config
+from .config import PROJECT_ROOT, load_config, save_config
 from .diagnostics import SessionLog, classify_error, save_error_case
 from .downloader import DownloadCancelled, download_media
 from .issue_reporter import report_error_cases
@@ -78,6 +78,28 @@ COMPLETION_ACTION_KEYS = {
     "open_folder": "completion_action_open_folder",
     "shutdown": "completion_action_shutdown",
 }
+ICON_DIR = PROJECT_ROOT / "img"
+ICON_SPECS = {
+    "app_logo": ("app_logo.png", 42),
+    "folder_open": ("folder_open.png", 20),
+    "folder_select": ("folder_select.png", 20),
+    "calendar": ("calendar.png", 20),
+    "settings": ("settings.png", 20),
+    "notification": ("notification.png", 20),
+    "start": ("start.png", 18),
+    "log_terminal": ("log_terminal.png", 20),
+    "stop": ("stop.png", 18),
+    "list": ("list.png", 20),
+}
+SECTION_ICON_ALIASES = {
+    "folder": "folder_open",
+    "target": "calendar",
+    "gear": "settings",
+    "complete": "notification",
+    "info": "notification",
+    "list": "list",
+    "log": "log_terminal",
+}
 
 
 class DownloaderApp:
@@ -141,6 +163,9 @@ class DownloaderApp:
         self.summary_stats_var = StringVar(value="완료 0 / 오류 0 / 건너뜀 0 / Playwright 0회")
 
         self._configure_style()
+        self.icons = self._load_icons()
+        if self.icons.get("app_logo"):
+            self.root.iconphoto(True, self.icons["app_logo"])
         self._build_ui()
         self._poll_events()
         self.root.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -164,6 +189,8 @@ class DownloaderApp:
         self.style.configure("Panel.TFrame", background=COLORS["panel"])
         self.style.configure("HeaderTitle.TLabel", font=title_font, background=COLORS["bg"], foreground="#101828")
         self.style.configure("HeaderSub.TLabel", font=small_font, background=COLORS["bg"], foreground=COLORS["muted"])
+        self.style.configure("HeaderIcon.TLabel", background=COLORS["bg"])
+        self.style.configure("Icon.TLabel", background=COLORS["surface"])
         self.style.configure("TLabel", background=COLORS["surface"], foreground=COLORS["text"])
         self.style.configure("Muted.TLabel", font=small_font, background=COLORS["bg"], foreground=COLORS["muted"])
         self.style.configure("SurfaceMuted.TLabel", font=small_font, background=COLORS["surface"], foreground=COLORS["muted"])
@@ -281,12 +308,16 @@ class DownloaderApp:
         header.grid(row=0, column=0, sticky="ew", pady=(0, 12))
         header.columnconfigure(1, weight=1)
 
-        logo = Canvas(header, width=34, height=34, bg=COLORS["bg"], highlightthickness=0)
-        logo.grid(row=0, column=0, rowspan=2, sticky="w", padx=(2, 14))
-        logo.create_polygon(5, 5, 17, 11, 17, 25, 5, 31, fill=COLORS["accent_dark"], outline="")
-        logo.create_polygon(17, 4, 31, 12, 18, 19, fill="#2f8de4", outline="")
-        logo.create_polygon(18, 20, 31, 27, 17, 32, fill="#52a6ff", outline="")
-        logo.create_line(17, 10, 17, 27, fill="#ffffff", width=2)
+        logo_icon = self.icons.get("app_logo")
+        if logo_icon:
+            ttk.Label(header, image=logo_icon, style="HeaderIcon.TLabel").grid(row=0, column=0, rowspan=2, sticky="w", padx=(2, 14))
+        else:
+            logo = Canvas(header, width=34, height=34, bg=COLORS["bg"], highlightthickness=0)
+            logo.grid(row=0, column=0, rowspan=2, sticky="w", padx=(2, 14))
+            logo.create_polygon(5, 5, 17, 11, 17, 25, 5, 31, fill=COLORS["accent_dark"], outline="")
+            logo.create_polygon(17, 4, 31, 12, 18, 19, fill="#2f8de4", outline="")
+            logo.create_polygon(18, 20, 31, 27, 17, 32, fill="#52a6ff", outline="")
+            logo.create_line(17, 10, 17, 27, fill="#ffffff", width=2)
 
         ttk.Label(header, text="TVCF 한국 광고 다운로더", style="HeaderTitle.TLabel").grid(row=0, column=1, sticky="w")
         ttk.Label(
@@ -303,8 +334,8 @@ class DownloaderApp:
 
         self._section_title(card, "저장 위치", "folder").grid(row=0, column=0, sticky="w", padx=(18, 16), pady=14)
         ttk.Entry(card, textvariable=self.download_dir_var, style="Input.TEntry").grid(row=0, column=1, sticky="ew", pady=14)
-        ttk.Button(card, text="저장 폴더 열기", command=self._open_download_dir).grid(row=0, column=2, sticky="e", padx=(14, 8), pady=14)
-        ttk.Button(card, text="폴더 선택", command=self._choose_download_dir).grid(row=0, column=3, sticky="e", padx=(0, 18), pady=14)
+        self._icon_button(card, "저장 폴더 열기", self._open_download_dir, "folder_open").grid(row=0, column=2, sticky="e", padx=(14, 8), pady=14)
+        self._icon_button(card, "폴더 선택", self._choose_download_dir, "folder_select").grid(row=0, column=3, sticky="e", padx=(0, 18), pady=14)
 
     def _build_target_card(self, parent: ttk.Frame) -> None:
         card = self._card(parent, row=2)
@@ -400,8 +431,8 @@ class DownloaderApp:
         action.grid(row=4, column=0, sticky="ew", pady=(8, 10))
         action.columnconfigure(2, weight=1)
 
-        ttk.Button(action, text="다운로드 시작", command=self.download, style="Accent.TButton").grid(row=0, column=0, padx=(0, 10))
-        ttk.Button(action, text="중지", command=self.stop, style="Danger.TButton").grid(row=0, column=1)
+        self._icon_button(action, "다운로드 시작", self.download, "start", style="Accent.TButton").grid(row=0, column=0, padx=(0, 10))
+        self._icon_button(action, "중지", self.stop, "stop", style="Danger.TButton").grid(row=0, column=1)
         ttk.Label(action, text="현재 상태", style="Muted.TLabel").grid(row=0, column=3, sticky="e", padx=(0, 10))
         ttk.Label(action, textvariable=self.status_var, style="Muted.TLabel").grid(row=0, column=4, sticky="e")
 
@@ -433,9 +464,23 @@ class DownloaderApp:
         header.grid(row=0, column=0, sticky="ew", padx=18, pady=(12, 6))
         header.columnconfigure(0, weight=1)
         self._section_title(header, "다운로드 목록", "list").grid(row=0, column=0, sticky="w")
-        ttk.Button(header, text="체크 재다운로드", command=self._retry_selected_item, style="Text.TButton").grid(row=0, column=1, sticky="e", padx=(0, 8))
-        ttk.Button(header, text="보류 일괄 재다운로드", command=self._retry_deferred_items, style="Text.TButton").grid(row=0, column=2, sticky="e", padx=(0, 8))
-        ttk.Button(header, text="기훈이한테 이르기", command=self._report_selected_errors, style="Text.TButton").grid(row=0, column=3, sticky="e")
+        self._icon_button(header, "체크 재다운로드", self._retry_selected_item, "list", style="Text.TButton").grid(
+            row=0,
+            column=1,
+            sticky="e",
+            padx=(0, 8),
+        )
+        self._icon_button(header, "보류 일괄 재다운로드", self._retry_deferred_items, "list", style="Text.TButton").grid(
+            row=0,
+            column=2,
+            sticky="e",
+            padx=(0, 8),
+        )
+        self._icon_button(header, "기훈이한테 이르기", self._report_selected_errors, "notification", style="Text.TButton").grid(
+            row=0,
+            column=3,
+            sticky="e",
+        )
 
         filter_bar = ttk.Frame(card, style="Surface.TFrame")
         filter_bar.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 8))
@@ -455,7 +500,7 @@ class DownloaderApp:
         search_entry = ttk.Entry(filter_bar, textvariable=self.search_var, style="Input.TEntry")
         search_entry.grid(row=0, column=3, sticky="ew")
         search_entry.bind("<KeyRelease>", lambda _event: self._render_tree())
-        ttk.Button(filter_bar, text="지우기", command=self._clear_search, style="Text.TButton").grid(row=0, column=4, sticky="e", padx=(8, 0))
+        self._icon_button(filter_bar, "지우기", self._clear_search, "stop", style="Text.TButton").grid(row=0, column=4, sticky="e", padx=(8, 0))
 
         table_wrap = ttk.Frame(card, style="Surface.TFrame")
         table_wrap.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 12))
@@ -502,7 +547,7 @@ class DownloaderApp:
         header.grid(row=0, column=0, sticky="ew", padx=18, pady=(12, 6))
         header.columnconfigure(0, weight=1)
         self._section_title(header, "실시간 로그", "log").grid(row=0, column=0, sticky="w")
-        ttk.Button(header, text="로그 지우기", command=self._clear_log, style="Text.TButton").grid(row=0, column=1, sticky="e")
+        self._icon_button(header, "로그 지우기", self._clear_log, "log_terminal", style="Text.TButton").grid(row=0, column=1, sticky="e")
 
         log_wrap = ttk.Frame(card, style="Surface.TFrame")
         log_wrap.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
@@ -555,11 +600,50 @@ class DownloaderApp:
         card.grid(row=row, column=0, sticky="nsew", pady=(0, 10))
         return card
 
+    def _load_icons(self) -> dict[str, PhotoImage]:
+        icons: dict[str, PhotoImage] = {}
+        for name, (filename, target_size) in ICON_SPECS.items():
+            path = ICON_DIR / filename
+            if not path.exists():
+                continue
+            try:
+                image = PhotoImage(file=str(path))
+                scale = max(1, round(max(image.width(), image.height()) / target_size))
+                icons[name] = image.subsample(scale, scale)
+            except Exception:  # noqa: BLE001 - missing or unsupported images should not block startup.
+                continue
+        return icons
+
+    def _icon_button(
+        self,
+        parent: object,
+        text: str,
+        command: object,
+        icon: str,
+        style: str | None = None,
+    ) -> ttk.Button:
+        options = {
+            "text": text,
+            "command": command,
+        }
+        if style:
+            options["style"] = style
+        image = self.icons.get(icon)
+        if image:
+            options["image"] = image
+            options["compound"] = "left"
+        return ttk.Button(parent, **options)
+
     def _section_title(self, parent: object, text: str, icon: str) -> ttk.Frame:
         frame = ttk.Frame(parent, style="Surface.TFrame")
-        icon_canvas = Canvas(frame, width=18, height=18, bg=COLORS["surface"], highlightthickness=0)
-        icon_canvas.grid(row=0, column=0, sticky="w", padx=(0, 8))
-        self._draw_section_icon(icon_canvas, icon)
+        icon_name = SECTION_ICON_ALIASES.get(icon, icon)
+        icon_image = self.icons.get(icon_name)
+        if icon_image:
+            ttk.Label(frame, image=icon_image, style="Icon.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        else:
+            icon_canvas = Canvas(frame, width=18, height=18, bg=COLORS["surface"], highlightthickness=0)
+            icon_canvas.grid(row=0, column=0, sticky="w", padx=(0, 8))
+            self._draw_section_icon(icon_canvas, icon)
         ttk.Label(frame, text=text, style="SectionTitle.TLabel").grid(row=0, column=1, sticky="w")
         return frame
 
