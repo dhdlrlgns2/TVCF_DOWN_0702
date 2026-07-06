@@ -7,7 +7,13 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPO_URL = "https://github.com/dhdlrlgns2/TVCF_DOWN_0702.git"
 BRANCH = "main"
-CORE_FILES = ("main.py", "requirements.txt", "tvcf_downloader/gui.py", "tvcf_downloader/client.py")
+CORE_FILES = (
+    "main.py",
+    "requirements.txt",
+    "scripts/run_after_update.bat",
+    "tvcf_downloader/gui.py",
+    "tvcf_downloader/client.py",
+)
 
 
 def run_git(args: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:

@@ -10,10 +10,15 @@ Python 3.10 이상을 권장합니다.
 
 `START.bat` 파일 하나만 따로 전달해도 실행할 수 있습니다. 이 경우 `START.bat`이 있는 위치에 `TVCF_DOWN_0702` 폴더를 만들고 GitHub 저장소에서 최신 파일을 내려받은 뒤 실행합니다.
 
-`START.bat`은 실행할 때마다 자동으로 다음 작업을 처리합니다.
+`START.bat`은 가능하면 자주 바뀌지 않도록 최소 부트스트랩 파일로 유지합니다. 실행할 때마다 Git 최신 버전 확인과 저장소 준비만 먼저 처리하고, 업데이트가 적용된 뒤의 실제 실행 절차는 `scripts\run_after_update.bat`으로 넘깁니다.
+
+향후 `.venv`, `pip install`, Playwright, `bin` 도구 확인, GUI 실행 순서가 바뀌면 `START.bat`이 아니라 `scripts\run_after_update.bat`에서 관리합니다.
+
+실행 과정은 다음과 같이 나뉩니다.
 
 - Git 최신 버전 확인 및 자동 적용
 - `.git`이 없는 폴더라면 Git 저장소 연결 및 최신 파일 가져오기
+- `scripts\run_after_update.bat` 실행
 - `.venv` 가상환경 생성
 - `requirements.txt`가 바뀐 경우에만 `pip install -r requirements.txt` 실행
 - Playwright Chromium 브라우저 설치
@@ -31,7 +36,8 @@ Python 3.10 이상을 권장합니다.
 - 업데이트가 있으면 `git pull --ff-only`로 자동 적용합니다.
 - 로컬 코드 수정이 있으면 덮어쓰지 않고 자동 업데이트를 건너뜁니다.
 - zip으로 받은 폴더처럼 `.git` 정보가 없으면 Git 저장소를 연결하고 최신 파일을 가져옵니다. 기존 코드 파일은 `.update_backups` 폴더에 백업됩니다.
-- 업데이트 후 `requirements.txt`가 바뀌어도 이어서 패키지 설치 확인을 다시 실행합니다.
+- 업데이트 후 `START.bat`은 재시작하지 않고, 새로 받아진 `scripts\run_after_update.bat`을 바로 실행합니다.
+- 업데이트 후 `requirements.txt`가 바뀌어도 `scripts\run_after_update.bat`에서 패키지 설치 확인을 다시 실행합니다.
 
 ## 동작 방식
 
@@ -117,7 +123,7 @@ GUI는 현재 파일 진행률, 전체 진행률, 완료/오류/건너뜀 개수
 
 ## 도구 자동 갱신
 
-`START.bat` 실행 중 환경 체크 단계에서 `yt-dlp.exe`와 `ffmpeg.exe`를 확인합니다.
+`scripts\run_after_update.bat`의 환경 체크 단계에서 `yt-dlp.exe`와 `ffmpeg.exe`를 확인합니다.
 
 - `yt-dlp.exe`는 7일 이상 최신 확인을 하지 않았으면 최신 파일로 다시 내려받습니다.
 - `ffmpeg.exe`는 7일 이상 최신 확인을 하지 않았으면 BtbN FFmpeg-Builds 최신 릴리스와 비교하고, 새 빌드가 있으면 교체합니다.
