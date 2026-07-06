@@ -1,6 +1,7 @@
 import os
 import queue
 import re
+import subprocess
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -17,6 +18,7 @@ from .diagnostics import SessionLog, classify_error, save_error_case
 from .downloader import DownloadCancelled, download_media
 from .issue_reporter import report_error_cases
 from .models import MediaItem
+from .text_utils import decode_output
 
 
 COLORS = {
@@ -61,6 +63,16 @@ DEFERRED_RETRY_STATUSES = ERROR_STATUSES | {"중단됨", "보류"}
 DONE_STATUSES = {"완료", "재다운완료"}
 ACTIVE_STATUSES = {"상세 확인", "다운로드", "재시도", "대기열에 다시 추가됨"}
 QUALITY_OPTIONS = ("가능한 최고화질", "HD", "SD", "mobile")
+COMPLETION_ACTION_OPTIONS = {
+    "notify": ("안띄우기", "띄우기"),
+    "open_folder": ("안열기", "열기"),
+    "shutdown": ("안끄기", "끄기"),
+}
+COMPLETION_ACTION_KEYS = {
+    "notify": "completion_action_notify",
+    "open_folder": "completion_action_open_folder",
+    "shutdown": "completion_action_shutdown",
+}
 
 
 class DownloaderApp:
@@ -91,25 +103,27 @@ class DownloaderApp:
         self.session_log: SessionLog | None = None
         self.run_started_at: float = 0.0
         self.playwright_fallback_count = 0
-        self.notification_shown = False
+        self.completion_actions_ran = False
+        self.stop_requested_by_user = False
         self.last_metric_update = 0.0
 
         today = datetime.now().date()
         default_from = today - timedelta(days=30)
 
-        self.mode_var = StringVar(value="period")
         self.download_dir_var = StringVar(value=self.config.get("download_dir", ""))
         self.date_from_var = StringVar(value=self.config.get("date_from", default_from.strftime("%Y-%m-%d")))
         self.date_to_var = StringVar(value=self.config.get("date_to", today.strftime("%Y-%m-%d")))
         self.date_basis_var = StringVar(value=self.config.get("date_basis", "published"))
-        self.id_start_var = StringVar(value=self.config.get("id_start", ""))
-        self.id_end_var = StringVar(value=self.config.get("id_end", ""))
         self.quality_var = StringVar(value=self._normalize_quality(self.config.get("quality", "가능한 최고화질")))
         self.max_pages_var = IntVar(value=int(self.config.get("max_pages", 0)))
         self.parallel_var = IntVar(value=self._normalize_parallel(self.config.get("parallel_downloads", 1)))
         self.prefer_ytdlp_var = BooleanVar(value=bool(self.config.get("prefer_ytdlp", True)))
         self.playwright_var = BooleanVar(value=bool(self.config.get("use_playwright_fallback", True)))
-        self.notify_var = BooleanVar(value=bool(self.config.get("notify_on_complete", True)))
+        self.completion_notify_var = StringVar(value=self._completion_label("notify", self._completion_config_value("notify")))
+        self.completion_open_folder_var = StringVar(
+            value=self._completion_label("open_folder", self._completion_config_value("open_folder"))
+        )
+        self.completion_shutdown_var = StringVar(value=self._completion_label("shutdown", self._completion_config_value("shutdown")))
         self.status_filter_var = StringVar(value="전체")
         self.search_var = StringVar(value="")
         self.status_var = StringVar(value="대기 중")
@@ -272,7 +286,7 @@ class DownloaderApp:
         ttk.Label(header, text="TVCF 한국 광고 다운로더", style="HeaderTitle.TLabel").grid(row=0, column=1, sticky="w")
         ttk.Label(
             header,
-            text="기간 또는 ID 범위로 한국 광고 영상을 수집하고 다운로드합니다.",
+            text="기간으로 한국 광고 영상을 수집하고 다운로드합니다.",
             style="HeaderSub.TLabel",
         ).grid(row=1, column=1, sticky="w", pady=(3, 0))
         self.status_label = ttk.Label(header, textvariable=self.status_badge_var, style="Badge.Idle.TLabel", anchor="center")
@@ -298,7 +312,7 @@ class DownloaderApp:
         for idx in (2, 4, 6, 8):
             body.columnconfigure(idx, weight=1)
 
-        ttk.Radiobutton(body, text="기간", value="period", variable=self.mode_var).grid(row=0, column=0, sticky="w", padx=(0, 18), pady=6)
+        ttk.Label(body, text="기간").grid(row=0, column=0, sticky="w", padx=(0, 18), pady=6)
         ttk.Label(body, text="시작").grid(row=0, column=1, sticky="e", padx=(0, 8), pady=6)
         ttk.Entry(body, width=14, textvariable=self.date_from_var, style="Input.TEntry").grid(row=0, column=2, sticky="ew", padx=(0, 30), pady=6)
         ttk.Label(body, text="끝").grid(row=0, column=3, sticky="e", padx=(0, 8), pady=6)
@@ -319,12 +333,6 @@ class DownloaderApp:
             sticky="ew",
             pady=6,
         )
-
-        ttk.Radiobutton(body, text="ID 범위", value="id", variable=self.mode_var).grid(row=1, column=0, sticky="w", padx=(0, 18), pady=6)
-        ttk.Label(body, text="시작 ID").grid(row=1, column=1, sticky="e", padx=(0, 8), pady=6)
-        ttk.Entry(body, width=16, textvariable=self.id_start_var, style="Input.TEntry").grid(row=1, column=2, sticky="ew", padx=(0, 30), pady=6)
-        ttk.Label(body, text="끝 ID").grid(row=1, column=3, sticky="e", padx=(0, 8), pady=6)
-        ttk.Entry(body, width=16, textvariable=self.id_end_var, style="Input.TEntry").grid(row=1, column=4, sticky="ew", padx=(0, 30), pady=6)
 
     def _build_options_card(self, parent: ttk.Frame) -> None:
         card = self._card(parent, row=3)
@@ -356,18 +364,50 @@ class DownloaderApp:
             values=(1, 2, 3),
             style="Input.TCombobox",
         ).grid(row=0, column=5, sticky="w", padx=(0, 28))
-        ttk.Checkbutton(body, text="완료 알림", variable=self.notify_var).grid(row=0, column=6, sticky="w")
+
+        self._section_title(card, "다운로드 완료 시 동작", "complete").grid(row=2, column=0, sticky="w", padx=18, pady=(0, 4))
+        completion = ttk.Frame(card, style="Surface.TFrame")
+        completion.grid(row=3, column=0, sticky="ew", padx=18, pady=(0, 14))
+        for idx in (1, 3, 5):
+            completion.columnconfigure(idx, weight=1)
+
+        ttk.Label(completion, text="알림창").grid(row=0, column=0, sticky="e", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            completion,
+            width=12,
+            state="readonly",
+            textvariable=self.completion_notify_var,
+            values=COMPLETION_ACTION_OPTIONS["notify"],
+            style="Input.TCombobox",
+        ).grid(row=0, column=1, sticky="w", padx=(0, 32), pady=4)
+        ttk.Label(completion, text="폴더").grid(row=0, column=2, sticky="e", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            completion,
+            width=12,
+            state="readonly",
+            textvariable=self.completion_open_folder_var,
+            values=COMPLETION_ACTION_OPTIONS["open_folder"],
+            style="Input.TCombobox",
+        ).grid(row=0, column=3, sticky="w", padx=(0, 32), pady=4)
+        ttk.Label(completion, text="전원").grid(row=0, column=4, sticky="e", padx=(0, 8), pady=4)
+        ttk.Combobox(
+            completion,
+            width=12,
+            state="readonly",
+            textvariable=self.completion_shutdown_var,
+            values=COMPLETION_ACTION_OPTIONS["shutdown"],
+            style="Input.TCombobox",
+        ).grid(row=0, column=5, sticky="w", pady=4)
 
     def _build_actions(self, parent: ttk.Frame) -> None:
         action = ttk.Frame(parent, style="Main.TFrame")
         action.grid(row=4, column=0, sticky="ew", pady=(8, 10))
-        action.columnconfigure(3, weight=1)
+        action.columnconfigure(2, weight=1)
 
-        ttk.Button(action, text="미리보기", command=self.preview).grid(row=0, column=0, padx=(0, 10))
-        ttk.Button(action, text="다운로드 시작", command=self.download, style="Accent.TButton").grid(row=0, column=1, padx=(0, 10))
-        ttk.Button(action, text="중지", command=self.stop, style="Danger.TButton").grid(row=0, column=2)
-        ttk.Label(action, text="현재 상태", style="Muted.TLabel").grid(row=0, column=4, sticky="e", padx=(0, 10))
-        ttk.Label(action, textvariable=self.status_var, style="Muted.TLabel").grid(row=0, column=5, sticky="e")
+        ttk.Button(action, text="다운로드 시작", command=self.download, style="Accent.TButton").grid(row=0, column=0, padx=(0, 10))
+        ttk.Button(action, text="중지", command=self.stop, style="Danger.TButton").grid(row=0, column=1)
+        ttk.Label(action, text="현재 상태", style="Muted.TLabel").grid(row=0, column=3, sticky="e", padx=(0, 10))
+        ttk.Label(action, textvariable=self.status_var, style="Muted.TLabel").grid(row=0, column=4, sticky="e")
 
     def _build_checkpoint_card(self, parent: ttk.Frame) -> None:
         card = self._card(parent, row=5)
@@ -633,6 +673,8 @@ class DownloaderApp:
         self._log(f"재다운로드 대기열에 {added}개 항목을 추가했습니다.")
         self._set_status("재다운로드 대기열 실행 중")
         self.worker = threading.Thread(target=self._retry_queue_worker_run, daemon=True)
+        self.stop_requested_by_user = False
+        self.completion_actions_ran = False
         self.worker.start()
 
     def _retry_selected_item(self) -> None:
@@ -870,13 +912,11 @@ class DownloaderApp:
         except OSError:
             pass
 
-    def preview(self) -> None:
-        self._start_worker(download=False)
-
     def download(self) -> None:
         self._start_worker(download=True)
 
     def stop(self) -> None:
+        self.stop_requested_by_user = True
         self.stop_event.set()
         self._log(f"중지 요청: {self.last_checkpoint}")
 
@@ -886,12 +926,13 @@ class DownloaderApp:
             return
 
         self.stop_event.clear()
+        self.stop_requested_by_user = False
         self._save_current_config()
         self.run_summary = self._build_run_summary()
         self.session_log = SessionLog(self.run_summary)
         self.run_started_at = time.monotonic()
         self.playwright_fallback_count = 0
-        self.notification_shown = False
+        self.completion_actions_ran = False
         self.file_progress_var.set("현재 파일: 계산 중")
         self.speed_var.set("속도: 계산 중")
         self.eta_var.set("남은 시간: 계산 중")
@@ -913,7 +954,7 @@ class DownloaderApp:
             self._checkpoint(f"대상 수집 완료: {self.run_summary} / 대상 {len(items)}개")
 
             if not download:
-                self.events.put(("status", f"미리보기 완료: {len(items)}개"))
+                self.events.put(("status", f"대상 확인 완료: {len(items)}개"))
                 return
 
             if not items:
@@ -1029,47 +1070,19 @@ class DownloaderApp:
         return False
 
     def _build_items(self, client: TVCFClient) -> list[MediaItem]:
-        if self.mode_var.get() == "period":
-            start = datetime.strptime(self.date_from_var.get().strip(), "%Y-%m-%d").date()
-            end = datetime.strptime(self.date_to_var.get().strip(), "%Y-%m-%d").date()
-            if start > end:
-                start, end = end, start
-            items = client.collect_period(
-                start,
-                end,
-                self.date_basis_var.get(),
-                self.max_pages_var.get(),
-                log=lambda msg: self.events.put(("log", msg)),
-                should_stop=self.stop_event.is_set,
-            )
-            return self._sort_items_by_file_date(items)
-
-        start_id = self.id_start_var.get().strip()
-        end_id = self.id_end_var.get().strip() or start_id
-        if start_id.isdigit() and end_id.isdigit():
-            left, right = sorted((int(start_id), int(end_id)))
-            identifiers = [str(value) for value in range(left, right + 1)]
-        else:
-            identifiers = [start_id]
-
-        items: list[MediaItem] = []
-        for identifier in identifiers:
-            if self.stop_event.is_set():
-                break
-            try:
-                item = client.get_media(
-                    identifier,
-                    use_playwright_fallback=self.playwright_var.get(),
-                    log=lambda msg: self.events.put(("log", msg)),
-                )
-                if item.country_code == "410" and (item.category_code == "1" or item.category_name == "광고"):
-                    items.append(item)
-                else:
-                    self.events.put(("log", f"{identifier}: 한국 광고가 아니어서 제외"))
-            except TVCFError as exc:
-                self._save_error_case(identifier, MediaItem(nidx=identifier), "ID 상세 확인", exc)
-                self.events.put(("log", f"{identifier}: {exc}"))
-        return items
+        start = datetime.strptime(self.date_from_var.get().strip(), "%Y-%m-%d").date()
+        end = datetime.strptime(self.date_to_var.get().strip(), "%Y-%m-%d").date()
+        if start > end:
+            start, end = end, start
+        items = client.collect_period(
+            start,
+            end,
+            self.date_basis_var.get(),
+            self.max_pages_var.get(),
+            log=lambda msg: self.events.put(("log", msg)),
+            should_stop=self.stop_event.is_set,
+        )
+        return self._sort_items_by_file_date(items)
 
     def _sort_items_by_file_date(self, items: list[MediaItem]) -> list[MediaItem]:
         basis = self.date_basis_var.get()
@@ -1122,7 +1135,8 @@ class DownloaderApp:
         elif kind == "status":
             self._set_status(event[1])
             self._log(event[1])
-            self._maybe_show_completion_dialog(event[1])
+            if self._is_completion_status(event[1]):
+                self.root.after(250, lambda status=event[1]: self._maybe_run_completion_actions(status))
         elif kind == "items":
             self.items = event[1]
             self._show_items(self.items)
@@ -1260,7 +1274,7 @@ class DownloaderApp:
             self.log_text.delete("1.0", "end")
 
     def _log(self, message: str) -> None:
-        message = str(message)
+        message = decode_output(message)
         self._parse_download_metrics(message)
         if "Playwright fallback 사용" in message:
             self.playwright_fallback_count += 1
@@ -1352,22 +1366,68 @@ class DownloaderApp:
             return f"{minute}분 {sec}초"
         return f"{sec}초"
 
-    def _maybe_show_completion_dialog(self, status: str) -> None:
-        if self.notification_shown or not self.notify_var.get():
+    @staticmethod
+    def _is_completion_status(status: str) -> bool:
+        return status.startswith("다운로드 완료") or status.startswith("재다운로드 완료")
+
+    def _maybe_run_completion_actions(self, status: str) -> None:
+        if self.completion_actions_ran or not self._is_completion_status(status):
             return
-        if not (status.startswith("다운로드 완료") or status.startswith("재다운로드 완료")):
+        if self.stop_requested_by_user or self.stop_event.is_set():
             return
-        self.notification_shown = True
+        self.completion_actions_ran = True
+
+        done, errors, skipped = self._completion_counts()
+        if self._completion_action_on("notify"):
+            messagebox.showinfo(
+                "작업 완료",
+                f"작업이 완료되었습니다.\n\n완료: {done}개\n오류: {errors}개\n건너뜀: {skipped}개",
+            )
+        if self._completion_action_on("open_folder"):
+            self._open_download_dir_from_completion()
+        if self._completion_action_on("shutdown"):
+            self._schedule_shutdown()
+
+    def _completion_counts(self) -> tuple[int, int, int]:
         statuses = [str(record.get("status", "")) for record in self.row_records.values()]
         done = sum(1 for value in statuses if value in DONE_STATUSES)
         errors = sum(1 for value in statuses if value in ERROR_STATUSES)
         skipped = sum(1 for value in statuses if value == "건너뜀")
-        open_folder = messagebox.askyesno(
-            "작업 완료",
-            f"작업이 완료되었습니다.\n\n완료: {done}개\n오류: {errors}개\n건너뜀: {skipped}개\n\n저장 폴더를 열까요?",
-        )
-        if open_folder:
-            self._open_download_dir()
+        return done, errors, skipped
+
+    def _open_download_dir_from_completion(self) -> None:
+        path = Path(self.download_dir_var.get().strip()).expanduser()
+        if not path.exists() or not path.is_dir():
+            self._log(f"경고: 저장 폴더를 열 수 없습니다. 경로가 없거나 접근할 수 없습니다: {path}")
+            return
+        if os.name != "nt":
+            self._log("경고: 저장 폴더 열기는 Windows에서만 동작합니다.")
+            return
+        try:
+            os.startfile(str(path))
+        except OSError as exc:
+            self._log(f"경고: 저장 폴더를 열 수 없습니다: {exc}")
+
+    def _schedule_shutdown(self) -> None:
+        if os.name != "nt":
+            self._log("경고: 전원 끄기 옵션은 Windows에서만 동작합니다.")
+            return
+        self._log("60초 후 전원이 꺼집니다. 취소하려면 Windows에서 shutdown /a를 실행하세요.")
+        creationflags = subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0
+        try:
+            subprocess.Popen(
+                [
+                    "shutdown",
+                    "/s",
+                    "/t",
+                    "60",
+                    "/c",
+                    "TVCF Downloader completed. The PC will shut down in 60 seconds.",
+                ],
+                creationflags=creationflags,
+            )
+        except OSError as exc:
+            self._log(f"경고: 전원 끄기 예약 실패: {exc}")
 
     def _checkpoint(self, message: str) -> None:
         self.last_checkpoint = message
@@ -1431,6 +1491,39 @@ class DownloaderApp:
             return 1
         return min(3, max(1, number))
 
+    def _completion_config_value(self, action: str) -> str:
+        saved_actions = self.config.get("completion_actions")
+        if isinstance(saved_actions, dict):
+            return self._normalize_completion_action(saved_actions.get(action))
+        legacy_key = COMPLETION_ACTION_KEYS.get(action, "")
+        if legacy_key:
+            return self._normalize_completion_action(self.config.get(legacy_key))
+        return "off"
+
+    @staticmethod
+    def _normalize_completion_action(value: object) -> str:
+        text = str(value or "").strip().casefold()
+        return "on" if text in {"on", "true", "1", "yes", "y"} else "off"
+
+    @staticmethod
+    def _completion_label(action: str, value: str) -> str:
+        options = COMPLETION_ACTION_OPTIONS[action]
+        return options[1] if value == "on" else options[0]
+
+    @staticmethod
+    def _completion_value_from_label(action: str, label: str) -> str:
+        options = COMPLETION_ACTION_OPTIONS[action]
+        return "on" if label == options[1] else "off"
+
+    def _completion_action_on(self, action: str) -> bool:
+        if action == "notify":
+            label = self.completion_notify_var.get()
+        elif action == "open_folder":
+            label = self.completion_open_folder_var.get()
+        else:
+            label = self.completion_shutdown_var.get()
+        return self._completion_value_from_label(action, label) == "on"
+
     def _sync_wraplength(self, event: object | None = None) -> None:
         if not hasattr(self, "current_task_label"):
             return
@@ -1440,23 +1533,17 @@ class DownloaderApp:
     def _build_run_summary(self) -> str:
         max_pages = self.max_pages_var.get()
         max_pages_label = "자동" if max_pages <= 0 else f"{max_pages}페이지"
-        if self.mode_var.get() == "period":
-            return (
-                f"{self.date_from_var.get()}~{self.date_to_var.get()} / "
-                f"기준 {self.date_basis_var.get()} / 화질 {self.quality_var.get()} / "
-                f"페이지 {max_pages_label} / 병렬 {self._normalize_parallel(self.parallel_var.get())} / "
-                f"저장 {self.download_dir_var.get()}"
-            )
-
         return (
-            f"ID {self.id_start_var.get()}~{self.id_end_var.get() or self.id_start_var.get()} / "
+            f"{self.date_from_var.get()}~{self.date_to_var.get()} / "
+            f"기준 {self.date_basis_var.get()} / "
             f"화질 {self.quality_var.get()} / 병렬 {self._normalize_parallel(self.parallel_var.get())} / "
+            f"페이지 {max_pages_label} / "
             f"저장 {self.download_dir_var.get()}"
         )
 
     def _item_position_text(self, index: int, total: int, item: MediaItem) -> str:
         item_date = item.date_value(self.date_basis_var.get())
-        if self.mode_var.get() == "period" and item_date:
+        if item_date:
             return f"{item_date}, {index}/{total}번째"
 
         return f"{index}/{total}번째"
@@ -1474,12 +1561,14 @@ class DownloaderApp:
                 "date_from": self.date_from_var.get(),
                 "date_to": self.date_to_var.get(),
                 "date_basis": self.date_basis_var.get(),
-                "id_start": self.id_start_var.get(),
-                "id_end": self.id_end_var.get(),
                 "quality": self.quality_var.get(),
                 "max_pages": self.max_pages_var.get(),
                 "parallel_downloads": self._normalize_parallel(self.parallel_var.get()),
-                "notify_on_complete": self.notify_var.get(),
+                "completion_actions": {
+                    "notify": self._completion_value_from_label("notify", self.completion_notify_var.get()),
+                    "open_folder": self._completion_value_from_label("open_folder", self.completion_open_folder_var.get()),
+                    "shutdown": self._completion_value_from_label("shutdown", self.completion_shutdown_var.get()),
+                },
                 "prefer_ytdlp": self.prefer_ytdlp_var.get(),
                 "use_playwright_fallback": self.playwright_var.get(),
                 "last_checkpoint": self.last_checkpoint,

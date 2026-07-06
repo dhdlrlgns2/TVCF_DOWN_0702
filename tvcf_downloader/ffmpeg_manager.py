@@ -10,6 +10,7 @@ from typing import Callable, Optional
 from urllib.request import Request, urlopen
 
 from .config import PROJECT_ROOT
+from .text_utils import decode_output, subprocess_env
 
 
 LogCallback = Optional[Callable[[str], None]]
@@ -124,16 +125,15 @@ def ffmpeg_version(path: Path) -> str:
         process = subprocess.run(
             [str(path), "-version"],
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            env=subprocess_env(),
             timeout=10,
             check=True,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
 
-    return process.stdout.splitlines()[0].strip() if process.stdout else ""
+    stdout = decode_output(process.stdout)
+    return stdout.splitlines()[0].strip() if stdout else ""
 
 
 def _download_file(url: str, destination: Path, log: LogCallback = None) -> None:

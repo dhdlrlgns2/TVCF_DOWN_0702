@@ -12,7 +12,11 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "date_basis": "published",
     "max_pages": 0,
     "parallel_downloads": 1,
-    "notify_on_complete": True,
+    "completion_actions": {
+        "notify": "off",
+        "open_folder": "off",
+        "shutdown": "off",
+    },
     "prefer_ytdlp": True,
     "use_playwright_fallback": True,
     "last_checkpoint": "작업 없음",

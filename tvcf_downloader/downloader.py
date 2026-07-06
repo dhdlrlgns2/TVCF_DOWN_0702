@@ -14,6 +14,7 @@ from .config import PROJECT_ROOT
 from .ffmpeg_manager import ensure_ffmpeg
 from .history import find_record, record_download, valid_record_path
 from .models import MediaItem
+from .text_utils import decode_output, subprocess_env
 
 
 LogCallback = Optional[Callable[[str], None]]
@@ -88,7 +89,7 @@ def is_valid_media_file(path: Path, ffprobe: str) -> bool:
         return True
 
     try:
-        duration = subprocess.run(
+        duration_process = subprocess.run(
             [
                 ffprobe,
                 "-v",
@@ -100,13 +101,12 @@ def is_valid_media_file(path: Path, ffprobe: str) -> bool:
                 str(path),
             ],
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            env=subprocess_env(),
             timeout=20,
             check=True,
-        ).stdout.strip()
-        has_video = subprocess.run(
+        )
+        duration = decode_output(duration_process.stdout).strip()
+        has_video_process = subprocess.run(
             [
                 ffprobe,
                 "-v",
@@ -120,12 +120,11 @@ def is_valid_media_file(path: Path, ffprobe: str) -> bool:
                 str(path),
             ],
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            env=subprocess_env(),
             timeout=20,
             check=True,
-        ).stdout.strip()
+        )
+        has_video = decode_output(has_video_process.stdout).strip()
     except (OSError, subprocess.SubprocessError, ValueError):
         return False
 
@@ -404,14 +403,12 @@ def _run_command(cmd: Sequence[str], log: LogCallback, should_stop: StopCallback
         list(cmd),
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
+        env=subprocess_env(),
         creationflags=creationflags,
     )
 
     assert process.stdout is not None
-    for line in process.stdout:
+    for raw_line in process.stdout:
         if should_stop and should_stop():
             process.terminate()
             try:
@@ -421,7 +418,7 @@ def _run_command(cmd: Sequence[str], log: LogCallback, should_stop: StopCallback
                 process.wait(timeout=5)
             raise DownloadCancelled("사용자 중단 요청으로 다운로드 명령을 종료했습니다.")
 
-        line = line.strip()
+        line = decode_output(raw_line).strip()
         if line and log:
             safe_log(log, line)
 
@@ -431,10 +428,11 @@ def _run_command(cmd: Sequence[str], log: LogCallback, should_stop: StopCallback
 
 
 def safe_log(log: Callable[[str], None], message: str) -> None:
+    text = decode_output(message)
     try:
-        log(message)
+        log(text)
     except UnicodeEncodeError:
-        log(message.encode("cp949", errors="replace").decode("cp949", errors="replace"))
+        log(text.encode("utf-8", errors="replace").decode("utf-8", errors="replace"))
 
 
 def is_youtube_url(url: str) -> bool:
@@ -482,15 +480,13 @@ def ytdlp_version(cmd: Sequence[str]) -> str:
         process = subprocess.run(
             [*cmd, "--version"],
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            env=subprocess_env(),
             timeout=15,
             check=True,
         )
     except (OSError, subprocess.SubprocessError):
         return ""
-    return process.stdout.strip()
+    return decode_output(process.stdout).strip()
 
 
 def _manifest_is_fresh(path: Path, max_age_days: int) -> bool:

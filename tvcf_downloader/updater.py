@@ -3,6 +3,8 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
+from .text_utils import decode_output, subprocess_env
+
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPO_URL = "https://github.com/dhdlrlgns2/TVCF_DOWN_0702.git"
@@ -17,26 +19,48 @@ CORE_FILES = (
 
 
 def run_git(args: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    result = subprocess.run(
         ["git", "-C", str(PROJECT_ROOT), *args],
         capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=check,
+        env=subprocess_env(),
     )
+    completed = subprocess.CompletedProcess(
+        result.args,
+        result.returncode,
+        decode_output(result.stdout),
+        decode_output(result.stderr),
+    )
+    if check and completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            completed.args,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return completed
 
 
 def run_git_global(args: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
+    result = subprocess.run(
         ["git", *args],
         cwd=str(PROJECT_ROOT),
         capture_output=True,
-        text=True,
-        encoding="utf-8",
-        errors="replace",
-        check=check,
+        env=subprocess_env(),
     )
+    completed = subprocess.CompletedProcess(
+        result.args,
+        result.returncode,
+        decode_output(result.stdout),
+        decode_output(result.stderr),
+    )
+    if check and completed.returncode != 0:
+        raise subprocess.CalledProcessError(
+            completed.returncode,
+            completed.args,
+            output=completed.stdout,
+            stderr=completed.stderr,
+        )
+    return completed
 
 
 def git_available() -> bool:
@@ -44,9 +68,7 @@ def git_available() -> bool:
         subprocess.run(
             ["git", "--version"],
             capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
+            env=subprocess_env(),
             check=True,
         )
     except (OSError, subprocess.SubprocessError):

@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 
 
 from .models import MediaItem, parse_tvcf_date
+from .text_utils import decode_output, subprocess_env
 
 
 LogCallback = Optional[Callable[[str], None]]
@@ -189,9 +190,7 @@ class TVCFClient:
             process = subprocess.run(
                 cmd,
                 capture_output=True,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
+                env=subprocess_env(),
                 timeout=self.timeout,
             )
         except Exception as exc:  # noqa: BLE001 - probing is an optional fallback.
@@ -203,7 +202,7 @@ class TVCFClient:
             return {}
 
         streams: Dict[str, str] = {}
-        for line in process.stdout.splitlines():
+        for line in decode_output(process.stdout).splitlines():
             value = line.strip()
             if not value.startswith("http"):
                 continue
@@ -433,7 +432,7 @@ class TVCFClient:
                     match = re.search(r"charset=([\w-]+)", content_type, re.I)
                     if match:
                         encoding = match.group(1)
-                    return raw.decode(encoding, errors="replace")
+                    return decode_output(raw, preferred=encoding)
             except (HTTPError, IncompleteRead, TimeoutError, URLError, OSError) as exc:
                 last_error = exc
                 max_attempts, wait_seconds, reason = self._retry_policy(exc)

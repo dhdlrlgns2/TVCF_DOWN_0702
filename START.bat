@@ -1,7 +1,10 @@
 @echo off
 setlocal EnableExtensions
+chcp 65001 >nul
 cd /d "%~dp0"
 
+set "PYTHONUTF8=1"
+set "PYTHONIOENCODING=utf-8"
 set "REPO_URL=https://github.com/dhdlrlgns2/TVCF_DOWN_0702.git"
 set "APP_DIR=%CD%\TVCF_DOWN_0702"
 
