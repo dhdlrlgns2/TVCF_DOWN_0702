@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -408,6 +409,8 @@ def _run_command(cmd: Sequence[str], log: LogCallback, should_stop: StopCallback
     )
 
     assert process.stdout is not None
+    last_progress_log = 0.0
+    pending_progress_line = ""
     for raw_line in process.stdout:
         if should_stop and should_stop():
             process.terminate()
@@ -420,11 +423,29 @@ def _run_command(cmd: Sequence[str], log: LogCallback, should_stop: StopCallback
 
         line = decode_output(raw_line).strip()
         if line and log:
+            if _is_progress_log_line(line):
+                now = time.monotonic()
+                if now - last_progress_log < 0.7:
+                    pending_progress_line = line
+                    continue
+                last_progress_log = now
+                pending_progress_line = ""
             safe_log(log, line)
 
     code = process.wait()
+    if code == 0 and pending_progress_line and log:
+        safe_log(log, pending_progress_line)
     if code != 0:
         raise DownloadError(f"명령 실행 실패(exit {code})")
+
+
+def _is_progress_log_line(line: str) -> bool:
+    return (
+        line.startswith("[download]")
+        or line.startswith("frame=")
+        or " speed=" in line
+        or " ETA " in line
+    )
 
 
 def safe_log(log: Callable[[str], None], message: str) -> None:

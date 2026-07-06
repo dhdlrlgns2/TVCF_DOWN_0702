@@ -4,7 +4,7 @@ import re
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -100,6 +100,9 @@ SECTION_ICON_ALIASES = {
     "list": "list",
     "log": "log_terminal",
 }
+MAX_GUI_EVENTS_PER_TICK = 80
+MAX_VISIBLE_LOG_LINES = 2000
+LOG_TRIM_LINES = 400
 
 
 class DownloaderApp:
@@ -133,6 +136,8 @@ class DownloaderApp:
         self.completion_actions_ran = False
         self.stop_requested_by_user = False
         self.last_metric_update = 0.0
+        self.log_line_count = 0
+        self.last_checkpoint_save_at = 0.0
 
         today = datetime.now().date()
         default_from = today - timedelta(days=30)
@@ -790,7 +795,8 @@ class DownloaderApp:
         self.progress_text_var.set(f"0 / {added}")
         self._log(f"재다운로드 대기열에 {added}개 항목을 추가했습니다.")
         self._set_status("재다운로드 대기열 실행 중")
-        self.worker = threading.Thread(target=self._retry_queue_worker_run, daemon=True)
+        options = self._download_options_snapshot()
+        self.worker = threading.Thread(target=self._retry_queue_worker_run, args=(options,), daemon=True)
         self.stop_requested_by_user = False
         self.completion_actions_ran = False
         self.worker.start()
@@ -857,10 +863,10 @@ class DownloaderApp:
         self.progress.configure(maximum=max(1, new_maximum))
         self._set_progress_text(current, new_maximum)
 
-    def _retry_queue_worker_run(self) -> None:
+    def _retry_queue_worker_run(self, options: dict[str, object]) -> None:
         try:
             client = TVCFClient()
-            failed_count = self._drain_retry_queue(client)
+            failed_count = self._drain_retry_queue(client, options)
             if failed_count:
                 self.events.put(("status", f"재다운로드 완료(오류 {failed_count}개)"))
             else:
@@ -873,7 +879,7 @@ class DownloaderApp:
             self.events.put(("status", "재다운로드 오류"))
             self.events.put(("log", f"재다운로드 대기열 실패: {exc}"))
 
-    def _drain_retry_queue(self, client: TVCFClient) -> int:
+    def _drain_retry_queue(self, client: TVCFClient, options: dict[str, object]) -> int:
         failed_count = 0
         while True:
             with self.retry_lock:
@@ -885,12 +891,12 @@ class DownloaderApp:
                 raise DownloadCancelled("사용자 중단 요청으로 재다운로드 대기열을 중단했습니다.")
 
             try:
-                self._download_retry_item(client, row_id, item)
+                self._download_retry_item(client, row_id, item, options)
             except DownloadCancelled:
                 raise
             except Exception as exc:  # noqa: BLE001 - keep draining retry queue.
                 failed_count += 1
-                category = self._save_error_case(row_id, item, "재다운로드", exc)
+                category = self._save_error_case(row_id, item, "재다운로드", exc, options)
                 self.events.put(("item_status", row_id, category))
                 self.events.put(("log", f"재다운로드 실패 - 건너뜀: {item.display_title} / {exc}"))
             finally:
@@ -900,13 +906,20 @@ class DownloaderApp:
 
         return failed_count
 
-    def _download_retry_item(self, client: TVCFClient, row_id: str, item: MediaItem) -> None:
+    def _download_retry_item(
+        self,
+        client: TVCFClient,
+        row_id: str,
+        item: MediaItem,
+        options: dict[str, object],
+    ) -> None:
         label = item.display_title
-        position = self._item_position_text(1, 1, item)
+        date_basis = str(options.get("date_basis", "published"))
+        position = self._item_position_text(1, 1, item, date_basis)
 
         self._checkpoint(f"{self.run_summary} / {position} 상세 확인 중 / {label}")
         self.events.put(("item_status", row_id, "상세 확인"))
-        detail = self._get_media_for_retry(client, item)
+        detail = self._get_media_for_retry(client, item, use_playwright=bool(options.get("use_playwright_fallback", True)))
 
         if detail.country_code and detail.country_code != "410":
             self._record_session("한국 아님", "재다운로드", detail, "한국 광고가 아니어서 제외")
@@ -926,10 +939,10 @@ class DownloaderApp:
         try:
             output = download_media(
                 merged,
-                self.download_dir_var.get(),
-                self.quality_var.get(),
-                self._date_basis_value(),
-                prefer_ytdlp=self.prefer_ytdlp_var.get(),
+                str(options.get("download_dir", "")),
+                str(options.get("quality", "가능한 최고화질")),
+                date_basis,
+                prefer_ytdlp=bool(options.get("prefer_ytdlp", True)),
                 log=lambda msg: self.events.put(("log", msg)),
                 should_stop=self.stop_event.is_set,
                 force=True,
@@ -939,13 +952,13 @@ class DownloaderApp:
         except Exception as first_exc:  # noqa: BLE001 - one alternate recovery pass.
             self.events.put(("log", f"기본 재다운로드 실패: {first_exc}"))
             self.events.put(("log", "대체 방식으로 재시도합니다: 상세 정보 재조회 + ffmpeg 우선"))
-            detail = self._get_media_for_retry(client, merged, force_playwright=True)
+            detail = self._get_media_for_retry(client, merged, force_playwright=True, use_playwright=True)
             merged = self._merge_item(merged, detail)
             output = download_media(
                 merged,
-                self.download_dir_var.get(),
-                self.quality_var.get(),
-                self._date_basis_value(),
+                str(options.get("download_dir", "")),
+                str(options.get("quality", "가능한 최고화질")),
+                date_basis,
                 prefer_ytdlp=False,
                 log=lambda msg: self.events.put(("log", msg)),
                 should_stop=self.stop_event.is_set,
@@ -958,7 +971,13 @@ class DownloaderApp:
         self.events.put(("item_status", row_id, result_status))
         self.events.put(("log", f"재다운로드 저장 완료: {output.path}"))
 
-    def _get_media_for_retry(self, client: TVCFClient, item: MediaItem, force_playwright: bool = False) -> MediaItem:
+    def _get_media_for_retry(
+        self,
+        client: TVCFClient,
+        item: MediaItem,
+        force_playwright: bool = False,
+        use_playwright: bool = True,
+    ) -> MediaItem:
         identifiers = [
             item.nidx or item.play_url or item.idx,
             item.play_url,
@@ -975,7 +994,7 @@ class DownloaderApp:
             try:
                 return client.get_media(
                     identifier,
-                    use_playwright_fallback=force_playwright or self.playwright_var.get(),
+                    use_playwright_fallback=force_playwright or use_playwright,
                     log=lambda msg: self.events.put(("log", msg)),
                 )
             except Exception as exc:  # noqa: BLE001 - try another identifier.
@@ -983,15 +1002,30 @@ class DownloaderApp:
 
         raise TVCFError("; ".join(errors) if errors else "상세 정보를 찾지 못했습니다.")
 
-    def _save_error_case(self, row_id: str, item: MediaItem | None, stage: str, exc: BaseException | str) -> str:
+    def _save_error_case(
+        self,
+        row_id: str,
+        item: MediaItem | None,
+        stage: str,
+        exc: BaseException | str,
+        options: dict[str, object] | None = None,
+    ) -> str:
         category = classify_error(stage, exc)
+        if options:
+            download_dir = str(options.get("download_dir", ""))
+            quality = str(options.get("quality", "가능한 최고화질"))
+            date_basis = str(options.get("date_basis", "published"))
+        else:
+            download_dir = self.download_dir_var.get()
+            quality = self.quality_var.get()
+            date_basis = self._date_basis_value()
         context = {
             "run_summary": self.run_summary,
             "last_checkpoint": self.last_checkpoint,
-            "download_dir": self.download_dir_var.get(),
-            "quality": self.quality_var.get(),
-            "date_basis": self._date_basis_value(),
-            "file_date": item.date_label(self._date_basis_value()) if item else "",
+            "download_dir": download_dir,
+            "quality": quality,
+            "date_basis": date_basis,
+            "file_date": item.date_label(date_basis) if item else "",
             "playwright_fallback_count": self.playwright_fallback_count,
             "retry_policy": "network/timeout/HTTP 5xx up to 3, HTTP 429 delayed retry, HTTP 403 one fallback, HTTP 404 no retry",
         }
@@ -1061,13 +1095,26 @@ class DownloaderApp:
         self.progress_text_var.set("0 / 0")
         self._set_status("작업 준비 중")
 
-        self.worker = threading.Thread(target=self._worker_run, args=(download,), daemon=True)
+        options = self._download_options_snapshot()
+        self.worker = threading.Thread(target=self._worker_run, args=(download, options), daemon=True)
         self.worker.start()
 
-    def _worker_run(self, download: bool) -> None:
+    def _download_options_snapshot(self) -> dict[str, object]:
+        return {
+            "date_from": self.date_from_var.get().strip(),
+            "date_to": self.date_to_var.get().strip(),
+            "date_basis": self._date_basis_value(),
+            "download_dir": self.download_dir_var.get(),
+            "quality": self.quality_var.get(),
+            "parallel": self._normalize_parallel(self.parallel_var.get()),
+            "prefer_ytdlp": True,
+            "use_playwright_fallback": True,
+        }
+
+    def _worker_run(self, download: bool, options: dict[str, object]) -> None:
         try:
             client = TVCFClient()
-            items = self._build_items(client)
+            items = self._build_items(client, options)
             self.events.put(("items", items))
             self._checkpoint(f"대상 수집 완료: {self.run_summary} / 대상 {len(items)}개")
 
@@ -1082,36 +1129,19 @@ class DownloaderApp:
 
             self.events.put(("progress_max", max(1, len(items))))
             failed_count = 0
-            parallel_count = self._normalize_parallel(self.parallel_var.get())
+            parallel_count = self._normalize_parallel(options.get("parallel"))
             if parallel_count <= 1:
                 for index, item in enumerate(items, start=1):
                     if self.stop_event.is_set():
                         self.events.put(("status", "중단됨"))
                         self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
                         return
-                    failed_count += int(self._download_one_item(client, index, len(items), item))
+                    failed_count += int(self._download_one_item(client, index, len(items), item, options))
                     self.events.put(("progress", index))
             else:
-                self.events.put(("log", f"병렬 다운로드 {parallel_count}개로 실행합니다."))
-                completed = 0
-                with ThreadPoolExecutor(max_workers=parallel_count) as executor:
-                    future_map = {
-                        executor.submit(self._download_one_item, TVCFClient(), index, len(items), item): item
-                        for index, item in enumerate(items, start=1)
-                    }
-                    for future in as_completed(future_map):
-                        if self.stop_event.is_set():
-                            break
-                        try:
-                            failed_count += int(future.result())
-                        except DownloadCancelled:
-                            self.events.put(("status", "중단됨"))
-                            self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
-                            return
-                        completed += 1
-                        self.events.put(("progress", completed))
+                failed_count += self._download_items_parallel(items, parallel_count, options)
 
-            retry_failed_count = self._drain_retry_queue(client)
+            retry_failed_count = self._drain_retry_queue(client, options)
             failed_count += retry_failed_count
 
             if failed_count:
@@ -1120,18 +1150,81 @@ class DownloaderApp:
                 self.events.put(("status", "다운로드 완료"))
             self._checkpoint(f"작업 완료: {self.run_summary}")
         except Exception as exc:  # noqa: BLE001 - show GUI error.
-            self._save_error_case("", None, "전체 작업", exc)
+            self._save_error_case("", None, "전체 작업", exc, options)
             self.events.put(("status", "오류"))
             self.events.put(("log", f"오류: {exc}"))
             self.events.put(("log", f"마지막 작업: {self.last_checkpoint}"))
 
-    def _download_one_item(self, client: TVCFClient, index: int, total: int, item: MediaItem) -> bool:
+    def _download_items_parallel(self, items: list[MediaItem], parallel_count: int, options: dict[str, object]) -> int:
+        self.events.put(("log", f"병렬 다운로드 {parallel_count}개로 실행합니다."))
+        failed_count = 0
+        completed = 0
+        next_index = 0
+        in_flight: dict[Future, int] = {}
+
+        def submit_next(executor: ThreadPoolExecutor) -> None:
+            nonlocal next_index
+            if next_index >= len(items) or self.stop_event.is_set():
+                return
+            item_index = next_index + 1
+            item = items[next_index]
+            future = executor.submit(
+                self._download_one_item,
+                TVCFClient(),
+                item_index,
+                len(items),
+                item,
+                options,
+            )
+            in_flight[future] = item_index
+            next_index += 1
+
+        with ThreadPoolExecutor(max_workers=parallel_count) as executor:
+            for _ in range(parallel_count):
+                submit_next(executor)
+
+            while in_flight:
+                if self.stop_event.is_set():
+                    for future in in_flight:
+                        future.cancel()
+                    self.events.put(("status", "중단됨"))
+                    self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
+                    return failed_count
+
+                done, _pending = wait(in_flight, timeout=0.2, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+
+                for future in done:
+                    in_flight.pop(future, None)
+                    try:
+                        failed_count += int(future.result())
+                    except DownloadCancelled:
+                        self.stop_event.set()
+                        self.events.put(("status", "중단됨"))
+                        self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
+                        return failed_count
+                    completed += 1
+                    self.events.put(("progress", completed))
+                    submit_next(executor)
+
+        return failed_count
+
+    def _download_one_item(
+        self,
+        client: TVCFClient,
+        index: int,
+        total: int,
+        item: MediaItem,
+        options: dict[str, object],
+    ) -> bool:
         row_id = item.nidx or item.idx or item.mcode
         if self.stop_event.is_set():
             raise DownloadCancelled("사용자 중단 요청")
 
         label = item.display_title
-        position = self._item_position_text(index, total, item)
+        date_basis = str(options.get("date_basis", "published"))
+        position = self._item_position_text(index, total, item, date_basis)
         self._checkpoint(f"{self.run_summary} / {position} 상세 확인 중 / {label}")
         self.events.put(("item_status", row_id, "상세 확인"))
         self.events.put(("log", f"[{index}/{total}] {label}"))
@@ -1139,11 +1232,11 @@ class DownloaderApp:
         try:
             detail = client.get_media(
                 item.nidx or item.play_url or item.idx,
-                use_playwright_fallback=self.playwright_var.get(),
+                use_playwright_fallback=bool(options.get("use_playwright_fallback", True)),
                 log=lambda msg: self.events.put(("log", msg)),
             )
         except Exception as exc:  # noqa: BLE001 - keep batch moving after one bad page.
-            category = self._save_error_case(row_id, item, "상세 확인", exc)
+            category = self._save_error_case(row_id, item, "상세 확인", exc, options)
             self.events.put(("item_status", row_id, category))
             self.events.put(("log", f"상세 확인 오류 - 건너뜀: {label} / {exc}"))
             return True
@@ -1163,10 +1256,10 @@ class DownloaderApp:
         try:
             output = download_media(
                 merged,
-                self.download_dir_var.get(),
-                self.quality_var.get(),
-                self._date_basis_value(),
-                prefer_ytdlp=self.prefer_ytdlp_var.get(),
+                str(options.get("download_dir", "")),
+                str(options.get("quality", "가능한 최고화질")),
+                str(options.get("date_basis", "published")),
+                prefer_ytdlp=bool(options.get("prefer_ytdlp", True)),
                 log=lambda msg: self.events.put(("log", msg)),
                 should_stop=self.stop_event.is_set,
             )
@@ -1175,7 +1268,7 @@ class DownloaderApp:
             self.events.put(("item_status", row_id, "중단됨"))
             raise
         except Exception as exc:  # noqa: BLE001 - skip failed item and continue.
-            category = self._save_error_case(row_id, merged, "다운로드", exc)
+            category = self._save_error_case(row_id, merged, "다운로드", exc, options)
             self.events.put(("item_status", row_id, category))
             self.events.put(("log", f"다운로드 오류 - 건너뜀: {merged.display_title} / {exc}"))
             return True
@@ -1187,23 +1280,23 @@ class DownloaderApp:
         self.events.put(("log", f"저장 완료: {output.path}"))
         return False
 
-    def _build_items(self, client: TVCFClient) -> list[MediaItem]:
-        start = datetime.strptime(self.date_from_var.get().strip(), "%Y-%m-%d").date()
-        end = datetime.strptime(self.date_to_var.get().strip(), "%Y-%m-%d").date()
+    def _build_items(self, client: TVCFClient, options: dict[str, object]) -> list[MediaItem]:
+        start = datetime.strptime(str(options.get("date_from", "")).strip(), "%Y-%m-%d").date()
+        end = datetime.strptime(str(options.get("date_to", "")).strip(), "%Y-%m-%d").date()
         if start > end:
             start, end = end, start
+        date_basis = str(options.get("date_basis", "published"))
         items = client.collect_period(
             start,
             end,
-            self._date_basis_value(),
+            date_basis,
             0,
             log=lambda msg: self.events.put(("log", msg)),
             should_stop=self.stop_event.is_set,
         )
-        return self._sort_items_by_file_date(items)
+        return self._sort_items_by_file_date(items, date_basis)
 
-    def _sort_items_by_file_date(self, items: list[MediaItem]) -> list[MediaItem]:
-        basis = self._date_basis_value()
+    def _sort_items_by_file_date(self, items: list[MediaItem], basis: str) -> list[MediaItem]:
         indexed_items = list(enumerate(items))
         return [
             item
@@ -1238,13 +1331,17 @@ class DownloaderApp:
         )
 
     def _poll_events(self) -> None:
-        while True:
+        processed = 0
+        while processed < MAX_GUI_EVENTS_PER_TICK:
             try:
                 event = self.events.get_nowait()
             except queue.Empty:
                 break
             self._handle_event(event)
-        self.root.after(120, self._poll_events)
+            processed += 1
+
+        delay = 20 if processed >= MAX_GUI_EVENTS_PER_TICK else 120
+        self.root.after(delay, self._poll_events)
 
     def _handle_event(self, event: tuple) -> None:
         kind = event[0]
@@ -1327,6 +1424,9 @@ class DownloaderApp:
             visible_index += 1
         self._update_summary_stats()
 
+    def _filters_active(self) -> bool:
+        return self.status_filter_var.get() != "전체" or bool(self.search_var.get().strip())
+
     def _record_matches_filters(self, record: dict) -> bool:
         status_filter = self.status_filter_var.get()
         status = str(record.get("status", ""))
@@ -1360,12 +1460,15 @@ class DownloaderApp:
         record = self.row_records.get(item_id)
         if record:
             record["status"] = status
+        if self._filters_active():
+            self._render_tree()
+            return
         if self.tree.exists(item_id):
             values = list(self.tree.item(item_id, "values"))
             if len(values) >= 5:
                 values[4] = status
                 self.tree.item(item_id, values=values, tags=self._row_tags(status, self.tree.index(item_id)))
-        self._render_tree()
+        self._update_summary_stats()
 
     def _refresh_row_stripes(self) -> None:
         self._render_tree()
@@ -1408,6 +1511,7 @@ class DownloaderApp:
     def _clear_log(self) -> None:
         if hasattr(self, "log_text"):
             self.log_text.delete("1.0", "end")
+        self.log_line_count = 0
 
     def _log(self, message: str) -> None:
         message = decode_output(message)
@@ -1420,6 +1524,10 @@ class DownloaderApp:
         self.log_text.insert("end", f"[{timestamp}]  ", "time")
         self.log_text.insert("end", f"[{level}]  ", level)
         self.log_text.insert("end", f"{message}\n", "message")
+        self.log_line_count += 1
+        if self.log_line_count > MAX_VISIBLE_LOG_LINES:
+            self.log_text.delete("1.0", f"{LOG_TRIM_LINES + 1}.0")
+            self.log_line_count -= LOG_TRIM_LINES
         self.log_text.see("end")
 
     @staticmethod
@@ -1458,6 +1566,7 @@ class DownloaderApp:
         record = self.row_records.get(row_id)
         if record:
             record["saved_path"] = path
+        if self._filters_active():
             self._render_tree()
 
     def _clear_search(self) -> None:
@@ -1573,10 +1682,14 @@ class DownloaderApp:
         self.last_checkpoint = message
         self.current_task_var.set(message)
         self.config["last_checkpoint"] = message
-        try:
-            save_config(self.config)
-        except OSError:
-            pass
+        now = time.monotonic()
+        force_save = message.startswith(("작업 준비", "작업 완료", "재다운로드 대기열 완료"))
+        if force_save or now - self.last_checkpoint_save_at >= 2.0:
+            try:
+                save_config(self.config)
+                self.last_checkpoint_save_at = now
+            except OSError:
+                pass
 
     def _set_progress_text(self, value: int, maximum: int) -> None:
         if maximum <= 0:
@@ -1698,8 +1811,8 @@ class DownloaderApp:
             f"저장 {self.download_dir_var.get()}"
         )
 
-    def _item_position_text(self, index: int, total: int, item: MediaItem) -> str:
-        item_date = item.date_value(self._date_basis_value())
+    def _item_position_text(self, index: int, total: int, item: MediaItem, date_basis: str | None = None) -> str:
+        item_date = item.date_value(date_basis or self._date_basis_value())
         if item_date:
             return f"{item_date}, {index}/{total}번째"
 
