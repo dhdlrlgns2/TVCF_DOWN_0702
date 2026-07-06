@@ -80,16 +80,16 @@ COMPLETION_ACTION_KEYS = {
 }
 ICON_DIR = PROJECT_ROOT / "img"
 ICON_SPECS = {
-    "app_logo": ("app_logo.png", 42),
-    "folder_open": ("folder_open.png", 20),
-    "folder_select": ("folder_select.png", 20),
-    "calendar": ("calendar.png", 20),
-    "settings": ("settings.png", 20),
-    "notification": ("notification.png", 20),
-    "start": ("start.png", 18),
-    "log_terminal": ("log_terminal.png", 20),
-    "stop": ("stop.png", 18),
-    "list": ("list.png", 20),
+    "app_logo": ("app_logo.png", 52),
+    "folder_open": ("folder_open.png", 30),
+    "folder_select": ("folder_select.png", 30),
+    "calendar": ("calendar.png", 30),
+    "settings": ("settings.png", 28),
+    "notification": ("notification.png", 28),
+    "start": ("start.png", 26),
+    "log_terminal": ("log_terminal.png", 28),
+    "stop": ("stop.png", 26),
+    "list": ("list.png", 28),
 }
 SECTION_ICON_ALIASES = {
     "folder": "folder_open",
@@ -241,10 +241,10 @@ class DownloaderApp:
 
         self.style.configure("TButton", padding=(13, 7), background="#f8fafc", foreground=COLORS["text"], bordercolor="#ccd6e3")
         self.style.map("TButton", background=[("active", "#eef2f7")])
-        self.style.configure("Accent.TButton", background=COLORS["accent"], foreground="#ffffff", bordercolor=COLORS["accent"])
-        self.style.map("Accent.TButton", background=[("active", COLORS["accent_dark"])], foreground=[("active", "#ffffff")])
-        self.style.configure("Danger.TButton", background=COLORS["danger_soft"], foreground=COLORS["danger"], bordercolor="#f5b4b4")
-        self.style.map("Danger.TButton", background=[("active", "#ffd2d2")])
+        self.style.configure("Accent.TButton", background="#ffffff", foreground=COLORS["accent"], bordercolor="#b8c9e8")
+        self.style.map("Accent.TButton", background=[("active", "#f8fbff")], foreground=[("active", COLORS["accent_dark"])])
+        self.style.configure("Danger.TButton", background="#ffffff", foreground=COLORS["danger"], bordercolor="#efb8b8")
+        self.style.map("Danger.TButton", background=[("active", "#fff8f8")], foreground=[("active", COLORS["danger"])])
         self.style.configure("Text.TButton", padding=(8, 4), background=COLORS["surface"], foreground=COLORS["muted"], bordercolor=COLORS["surface"])
         self.style.map("Text.TButton", background=[("active", "#f2f5fa")], foreground=[("active", COLORS["text"])])
 
@@ -547,7 +547,7 @@ class DownloaderApp:
         header.grid(row=0, column=0, sticky="ew", padx=18, pady=(12, 6))
         header.columnconfigure(0, weight=1)
         self._section_title(header, "실시간 로그", "log").grid(row=0, column=0, sticky="w")
-        self._icon_button(header, "로그 지우기", self._clear_log, "log_terminal", style="Text.TButton").grid(row=0, column=1, sticky="e")
+        ttk.Button(header, text="로그 지우기", command=self._clear_log, style="Text.TButton").grid(row=0, column=1, sticky="e")
 
         log_wrap = ttk.Frame(card, style="Surface.TFrame")
         log_wrap.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
