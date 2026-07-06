@@ -63,6 +63,11 @@ DEFERRED_RETRY_STATUSES = ERROR_STATUSES | {"중단됨", "보류"}
 DONE_STATUSES = {"완료", "재다운완료"}
 ACTIVE_STATUSES = {"상세 확인", "다운로드", "재시도", "대기열에 다시 추가됨"}
 QUALITY_OPTIONS = ("가능한 최고화질", "HD", "SD", "mobile")
+DATE_BASIS_LABELS = {
+    "published": "방영일",
+    "registered": "TVCF 업로드 날짜",
+}
+DATE_BASIS_VALUES = {label: value for value, label in DATE_BASIS_LABELS.items()}
 COMPLETION_ACTION_OPTIONS = {
     "notify": ("안띄우기", "띄우기"),
     "open_folder": ("안열기", "열기"),
@@ -113,12 +118,12 @@ class DownloaderApp:
         self.download_dir_var = StringVar(value=self.config.get("download_dir", ""))
         self.date_from_var = StringVar(value=self.config.get("date_from", default_from.strftime("%Y-%m-%d")))
         self.date_to_var = StringVar(value=self.config.get("date_to", today.strftime("%Y-%m-%d")))
-        self.date_basis_var = StringVar(value=self.config.get("date_basis", "published"))
+        self.date_basis_label_var = StringVar(value=self._date_basis_label(self.config.get("date_basis", "published")))
         self.quality_var = StringVar(value=self._normalize_quality(self.config.get("quality", "가능한 최고화질")))
-        self.max_pages_var = IntVar(value=int(self.config.get("max_pages", 0)))
+        self.max_pages_var = IntVar(value=0)
         self.parallel_var = IntVar(value=self._normalize_parallel(self.config.get("parallel_downloads", 1)))
-        self.prefer_ytdlp_var = BooleanVar(value=bool(self.config.get("prefer_ytdlp", True)))
-        self.playwright_var = BooleanVar(value=bool(self.config.get("use_playwright_fallback", True)))
+        self.prefer_ytdlp_var = BooleanVar(value=True)
+        self.playwright_var = BooleanVar(value=True)
         self.completion_notify_var = StringVar(value=self._completion_label("notify", self._completion_config_value("notify")))
         self.completion_open_folder_var = StringVar(
             value=self._completion_label("open_folder", self._completion_config_value("open_folder"))
@@ -309,7 +314,7 @@ class DownloaderApp:
 
         body = ttk.Frame(card, style="Surface.TFrame")
         body.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 14))
-        for idx in (2, 4, 6, 8):
+        for idx in (2, 4, 6):
             body.columnconfigure(idx, weight=1)
 
         ttk.Label(body, text="기간").grid(row=0, column=0, sticky="w", padx=(0, 18), pady=6)
@@ -322,17 +327,10 @@ class DownloaderApp:
             body,
             width=13,
             state="readonly",
-            textvariable=self.date_basis_var,
-            values=("published", "registered"),
+            textvariable=self.date_basis_label_var,
+            values=tuple(DATE_BASIS_LABELS.values()),
             style="Input.TCombobox",
-        ).grid(row=0, column=6, sticky="ew", padx=(0, 30), pady=6)
-        ttk.Label(body, text="최대 페이지(0=자동)").grid(row=0, column=7, sticky="e", padx=(0, 8), pady=6)
-        ttk.Spinbox(body, from_=0, to=500, width=7, textvariable=self.max_pages_var, style="Input.TSpinbox").grid(
-            row=0,
-            column=8,
-            sticky="ew",
-            pady=6,
-        )
+        ).grid(row=0, column=6, sticky="ew", pady=6)
 
     def _build_options_card(self, parent: ttk.Frame) -> None:
         card = self._card(parent, row=3)
@@ -342,7 +340,7 @@ class DownloaderApp:
 
         body = ttk.Frame(card, style="Surface.TFrame")
         body.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 14))
-        body.columnconfigure(5, weight=1)
+        body.columnconfigure(3, weight=1)
 
         ttk.Label(body, text="화질").grid(row=0, column=0, sticky="w", padx=(0, 8))
         ttk.Combobox(
@@ -353,9 +351,7 @@ class DownloaderApp:
             values=QUALITY_OPTIONS,
             style="Input.TCombobox",
         ).grid(row=0, column=1, sticky="w", padx=(0, 36))
-        ttk.Checkbutton(body, text="yt-dlp 우선", variable=self.prefer_ytdlp_var).grid(row=0, column=2, sticky="w", padx=(0, 28))
-        ttk.Checkbutton(body, text="Playwright fallback", variable=self.playwright_var).grid(row=0, column=3, sticky="w", padx=(0, 28))
-        ttk.Label(body, text="병렬").grid(row=0, column=4, sticky="e", padx=(0, 8))
+        ttk.Label(body, text="병렬").grid(row=0, column=2, sticky="e", padx=(0, 8))
         ttk.Combobox(
             body,
             width=5,
@@ -363,7 +359,7 @@ class DownloaderApp:
             textvariable=self.parallel_var,
             values=(1, 2, 3),
             style="Input.TCombobox",
-        ).grid(row=0, column=5, sticky="w", padx=(0, 28))
+        ).grid(row=0, column=3, sticky="w", padx=(0, 28))
 
         self._section_title(card, "다운로드 완료 시 동작", "complete").grid(row=2, column=0, sticky="w", padx=18, pady=(0, 4))
         completion = ttk.Frame(card, style="Surface.TFrame")
@@ -810,7 +806,7 @@ class DownloaderApp:
                 merged,
                 self.download_dir_var.get(),
                 self.quality_var.get(),
-                self.date_basis_var.get(),
+                self._date_basis_value(),
                 prefer_ytdlp=self.prefer_ytdlp_var.get(),
                 log=lambda msg: self.events.put(("log", msg)),
                 should_stop=self.stop_event.is_set,
@@ -827,7 +823,7 @@ class DownloaderApp:
                 merged,
                 self.download_dir_var.get(),
                 self.quality_var.get(),
-                self.date_basis_var.get(),
+                self._date_basis_value(),
                 prefer_ytdlp=False,
                 log=lambda msg: self.events.put(("log", msg)),
                 should_stop=self.stop_event.is_set,
@@ -872,8 +868,8 @@ class DownloaderApp:
             "last_checkpoint": self.last_checkpoint,
             "download_dir": self.download_dir_var.get(),
             "quality": self.quality_var.get(),
-            "date_basis": self.date_basis_var.get(),
-            "file_date": item.date_label(self.date_basis_var.get()) if item else "",
+            "date_basis": self._date_basis_value(),
+            "file_date": item.date_label(self._date_basis_value()) if item else "",
             "playwright_fallback_count": self.playwright_fallback_count,
             "retry_policy": "network/timeout/HTTP 5xx up to 3, HTTP 429 delayed retry, HTTP 403 one fallback, HTTP 404 no retry",
         }
@@ -1047,7 +1043,7 @@ class DownloaderApp:
                 merged,
                 self.download_dir_var.get(),
                 self.quality_var.get(),
-                self.date_basis_var.get(),
+                self._date_basis_value(),
                 prefer_ytdlp=self.prefer_ytdlp_var.get(),
                 log=lambda msg: self.events.put(("log", msg)),
                 should_stop=self.stop_event.is_set,
@@ -1077,15 +1073,15 @@ class DownloaderApp:
         items = client.collect_period(
             start,
             end,
-            self.date_basis_var.get(),
-            self.max_pages_var.get(),
+            self._date_basis_value(),
+            0,
             log=lambda msg: self.events.put(("log", msg)),
             should_stop=self.stop_event.is_set,
         )
         return self._sort_items_by_file_date(items)
 
     def _sort_items_by_file_date(self, items: list[MediaItem]) -> list[MediaItem]:
-        basis = self.date_basis_var.get()
+        basis = self._date_basis_value()
         indexed_items = list(enumerate(items))
         return [
             item
@@ -1174,7 +1170,7 @@ class DownloaderApp:
             self.row_order.append(item_id)
             self.row_records[item_id] = {
                 "item": item,
-                "date": item.date_label(self.date_basis_var.get()),
+                "date": item.date_label(self._date_basis_value()),
                 "title": item.display_title,
                 "id": item_id,
                 "status": "대기",
@@ -1483,6 +1479,22 @@ class DownloaderApp:
         text = str(value or "").strip()
         return text if text in QUALITY_OPTIONS else "가능한 최고화질"
 
+    def _date_basis_value(self) -> str:
+        return self._normalize_date_basis(self.date_basis_label_var.get())
+
+    @staticmethod
+    def _date_basis_label(value: object) -> str:
+        return DATE_BASIS_LABELS[DownloaderApp._normalize_date_basis(value)]
+
+    @staticmethod
+    def _normalize_date_basis(value: object) -> str:
+        text = str(value or "").strip()
+        if text in DATE_BASIS_LABELS:
+            return text
+        if text in DATE_BASIS_VALUES:
+            return DATE_BASIS_VALUES[text]
+        return "published"
+
     @staticmethod
     def _normalize_parallel(value: object) -> int:
         try:
@@ -1531,18 +1543,15 @@ class DownloaderApp:
         self.current_task_label.configure(wraplength=width)
 
     def _build_run_summary(self) -> str:
-        max_pages = self.max_pages_var.get()
-        max_pages_label = "자동" if max_pages <= 0 else f"{max_pages}페이지"
         return (
             f"{self.date_from_var.get()}~{self.date_to_var.get()} / "
-            f"기준 {self.date_basis_var.get()} / "
+            f"기준 {self.date_basis_label_var.get()} / "
             f"화질 {self.quality_var.get()} / 병렬 {self._normalize_parallel(self.parallel_var.get())} / "
-            f"페이지 {max_pages_label} / "
             f"저장 {self.download_dir_var.get()}"
         )
 
     def _item_position_text(self, index: int, total: int, item: MediaItem) -> str:
-        item_date = item.date_value(self.date_basis_var.get())
+        item_date = item.date_value(self._date_basis_value())
         if item_date:
             return f"{item_date}, {index}/{total}번째"
 
@@ -1560,17 +1569,17 @@ class DownloaderApp:
                 "download_dir": self.download_dir_var.get(),
                 "date_from": self.date_from_var.get(),
                 "date_to": self.date_to_var.get(),
-                "date_basis": self.date_basis_var.get(),
+                "date_basis": self._date_basis_value(),
                 "quality": self.quality_var.get(),
-                "max_pages": self.max_pages_var.get(),
+                "max_pages": 0,
                 "parallel_downloads": self._normalize_parallel(self.parallel_var.get()),
                 "completion_actions": {
                     "notify": self._completion_value_from_label("notify", self.completion_notify_var.get()),
                     "open_folder": self._completion_value_from_label("open_folder", self.completion_open_folder_var.get()),
                     "shutdown": self._completion_value_from_label("shutdown", self.completion_shutdown_var.get()),
                 },
-                "prefer_ytdlp": self.prefer_ytdlp_var.get(),
-                "use_playwright_fallback": self.playwright_var.get(),
+                "prefer_ytdlp": True,
+                "use_playwright_fallback": True,
                 "last_checkpoint": self.last_checkpoint,
             }
         )
