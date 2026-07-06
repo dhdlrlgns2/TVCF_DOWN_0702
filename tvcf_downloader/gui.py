@@ -1,10 +1,14 @@
+import os
 import queue
+import re
 import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
 from tkinter import BooleanVar, Canvas, Frame, IntVar, StringVar, Tk, filedialog
-from tkinter import ttk
+from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
 from .client import TVCFClient, TVCFError
@@ -41,8 +45,22 @@ COLORS = {
     "log_red": "#f87171",
 }
 
-ERROR_STATUSES = {"오류", "상세 오류", "네트워크 오류", "스트림 없음", "yt-dlp 실패", "ffmpeg 실패", "파일 손상", "알 수 없는 오류"}
+ERROR_STATUSES = {
+    "오류",
+    "상세 오류",
+    "네트워크 오류",
+    "스트림 없음",
+    "yt-dlp 실패",
+    "ffmpeg 실패",
+    "파일 손상",
+    "접근 거부",
+    "요청 제한",
+    "알 수 없는 오류",
+}
 DEFERRED_RETRY_STATUSES = ERROR_STATUSES | {"중단됨", "보류"}
+DONE_STATUSES = {"완료", "재다운완료"}
+ACTIVE_STATUSES = {"상세 확인", "다운로드", "재시도", "대기열에 다시 추가됨"}
+QUALITY_OPTIONS = ("가능한 최고화질", "HD", "SD", "mobile")
 
 
 class DownloaderApp:
@@ -60,14 +78,21 @@ class DownloaderApp:
         self.worker: threading.Thread | None = None
         self.items: list[MediaItem] = []
         self.item_by_id: dict[str, MediaItem] = {}
+        self.row_records: dict[str, dict] = {}
+        self.row_order: list[str] = []
         self.checked_rows: set[str] = set()
         self.retry_queue: deque[tuple[str, MediaItem]] = deque()
         self.queued_retry_rows: set[str] = set()
         self.retry_lock = threading.Lock()
+        self.session_lock = threading.Lock()
         self.run_summary = ""
         self.last_checkpoint = self.config.get("last_checkpoint", "작업 없음")
         self.error_case_by_id: dict[str, str] = {}
         self.session_log: SessionLog | None = None
+        self.run_started_at: float = 0.0
+        self.playwright_fallback_count = 0
+        self.notification_shown = False
+        self.last_metric_update = 0.0
 
         today = datetime.now().date()
         default_from = today - timedelta(days=30)
@@ -79,14 +104,22 @@ class DownloaderApp:
         self.date_basis_var = StringVar(value=self.config.get("date_basis", "published"))
         self.id_start_var = StringVar(value=self.config.get("id_start", ""))
         self.id_end_var = StringVar(value=self.config.get("id_end", ""))
-        self.quality_var = StringVar(value=self.config.get("quality", "HD"))
+        self.quality_var = StringVar(value=self._normalize_quality(self.config.get("quality", "가능한 최고화질")))
         self.max_pages_var = IntVar(value=int(self.config.get("max_pages", 0)))
+        self.parallel_var = IntVar(value=self._normalize_parallel(self.config.get("parallel_downloads", 1)))
         self.prefer_ytdlp_var = BooleanVar(value=bool(self.config.get("prefer_ytdlp", True)))
         self.playwright_var = BooleanVar(value=bool(self.config.get("use_playwright_fallback", True)))
+        self.notify_var = BooleanVar(value=bool(self.config.get("notify_on_complete", True)))
+        self.status_filter_var = StringVar(value="전체")
+        self.search_var = StringVar(value="")
         self.status_var = StringVar(value="대기 중")
         self.status_badge_var = StringVar(value="● 대기 중")
         self.current_task_var = StringVar(value=self.last_checkpoint)
         self.progress_text_var = StringVar(value="0 / 0")
+        self.file_progress_var = StringVar(value="현재 파일: 계산 중")
+        self.speed_var = StringVar(value="속도: 계산 중")
+        self.eta_var = StringVar(value="남은 시간: 계산 중")
+        self.summary_stats_var = StringVar(value="완료 0 / 오류 0 / 건너뜀 0 / Playwright 0회")
 
         self._configure_style()
         self._build_ui()
@@ -251,7 +284,8 @@ class DownloaderApp:
 
         self._section_title(card, "저장 위치", "folder").grid(row=0, column=0, sticky="w", padx=(18, 16), pady=14)
         ttk.Entry(card, textvariable=self.download_dir_var, style="Input.TEntry").grid(row=0, column=1, sticky="ew", pady=14)
-        ttk.Button(card, text="폴더 선택", command=self._choose_download_dir).grid(row=0, column=2, sticky="e", padx=(14, 18), pady=14)
+        ttk.Button(card, text="저장 폴더 열기", command=self._open_download_dir).grid(row=0, column=2, sticky="e", padx=(14, 8), pady=14)
+        ttk.Button(card, text="폴더 선택", command=self._choose_download_dir).grid(row=0, column=3, sticky="e", padx=(0, 18), pady=14)
 
     def _build_target_card(self, parent: ttk.Frame) -> None:
         card = self._card(parent, row=2)
@@ -308,11 +342,21 @@ class DownloaderApp:
             width=14,
             state="readonly",
             textvariable=self.quality_var,
-            values=("HD", "SD", "mobile"),
+            values=QUALITY_OPTIONS,
             style="Input.TCombobox",
         ).grid(row=0, column=1, sticky="w", padx=(0, 36))
         ttk.Checkbutton(body, text="yt-dlp 우선", variable=self.prefer_ytdlp_var).grid(row=0, column=2, sticky="w", padx=(0, 28))
         ttk.Checkbutton(body, text="Playwright fallback", variable=self.playwright_var).grid(row=0, column=3, sticky="w", padx=(0, 28))
+        ttk.Label(body, text="병렬").grid(row=0, column=4, sticky="e", padx=(0, 8))
+        ttk.Combobox(
+            body,
+            width=5,
+            state="readonly",
+            textvariable=self.parallel_var,
+            values=(1, 2, 3),
+            style="Input.TCombobox",
+        ).grid(row=0, column=5, sticky="w", padx=(0, 28))
+        ttk.Checkbutton(body, text="완료 알림", variable=self.notify_var).grid(row=0, column=6, sticky="w")
 
     def _build_actions(self, parent: ttk.Frame) -> None:
         action = ttk.Frame(parent, style="Main.TFrame")
@@ -347,7 +391,7 @@ class DownloaderApp:
     def _build_list_card(self, parent: ttk.Frame) -> None:
         card = self._card(parent, row=6)
         card.columnconfigure(0, weight=1)
-        card.rowconfigure(1, weight=1, minsize=120)
+        card.rowconfigure(2, weight=1, minsize=120)
 
         header = ttk.Frame(card, style="Surface.TFrame")
         header.grid(row=0, column=0, sticky="ew", padx=18, pady=(12, 6))
@@ -357,8 +401,28 @@ class DownloaderApp:
         ttk.Button(header, text="보류 일괄 재다운로드", command=self._retry_deferred_items, style="Text.TButton").grid(row=0, column=2, sticky="e", padx=(0, 8))
         ttk.Button(header, text="기훈이한테 이르기", command=self._report_selected_errors, style="Text.TButton").grid(row=0, column=3, sticky="e")
 
+        filter_bar = ttk.Frame(card, style="Surface.TFrame")
+        filter_bar.grid(row=1, column=0, sticky="ew", padx=18, pady=(0, 8))
+        filter_bar.columnconfigure(3, weight=1)
+        ttk.Label(filter_bar, text="상태").grid(row=0, column=0, sticky="w", padx=(0, 8))
+        status_filter = ttk.Combobox(
+            filter_bar,
+            width=12,
+            state="readonly",
+            textvariable=self.status_filter_var,
+            values=("전체", "완료", "오류", "보류", "중단됨", "건너뜀", "다운로드 중"),
+            style="Input.TCombobox",
+        )
+        status_filter.grid(row=0, column=1, sticky="w", padx=(0, 18))
+        status_filter.bind("<<ComboboxSelected>>", lambda _event: self._render_tree())
+        ttk.Label(filter_bar, text="검색").grid(row=0, column=2, sticky="w", padx=(0, 8))
+        search_entry = ttk.Entry(filter_bar, textvariable=self.search_var, style="Input.TEntry")
+        search_entry.grid(row=0, column=3, sticky="ew")
+        search_entry.bind("<KeyRelease>", lambda _event: self._render_tree())
+        ttk.Button(filter_bar, text="지우기", command=self._clear_search, style="Text.TButton").grid(row=0, column=4, sticky="e", padx=(8, 0))
+
         table_wrap = ttk.Frame(card, style="Surface.TFrame")
-        table_wrap.grid(row=1, column=0, sticky="nsew", padx=18, pady=(0, 12))
+        table_wrap.grid(row=2, column=0, sticky="nsew", padx=18, pady=(0, 12))
         table_wrap.columnconfigure(0, weight=1)
         table_wrap.rowconfigure(0, weight=1)
 
@@ -433,8 +497,15 @@ class DownloaderApp:
 
         ttk.Label(card, text="진행률", style="ProgressTitle.TLabel").grid(row=0, column=0, sticky="w", padx=(18, 18), pady=13)
         self.progress = ttk.Progressbar(card, mode="determinate")
-        self.progress.grid(row=0, column=1, sticky="ew", pady=13)
+        self.progress.grid(row=0, column=1, sticky="ew", pady=(13, 4))
         ttk.Label(card, textvariable=self.progress_text_var, style="ProgressCount.TLabel").grid(row=0, column=2, sticky="e", padx=(18, 18), pady=13)
+        metrics = ttk.Frame(card, style="Surface.TFrame")
+        metrics.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 18), pady=(0, 12))
+        metrics.columnconfigure(3, weight=1)
+        ttk.Label(metrics, textvariable=self.file_progress_var, style="SurfaceMuted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 18))
+        ttk.Label(metrics, textvariable=self.speed_var, style="SurfaceMuted.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 18))
+        ttk.Label(metrics, textvariable=self.eta_var, style="SurfaceMuted.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 18))
+        ttk.Label(metrics, textvariable=self.summary_stats_var, style="SurfaceMuted.TLabel").grid(row=0, column=3, sticky="e")
 
     def _card(self, parent: ttk.Frame, row: int) -> Frame:
         card = Frame(
@@ -494,27 +565,22 @@ class DownloaderApp:
             self._toggle_row_checked(item_id)
 
     def _toggle_row_checked(self, row_id: str) -> None:
-        if not self.tree.exists(row_id):
-            return
-        values = list(self.tree.item(row_id, "values"))
-        if not values:
+        if row_id not in self.row_records:
             return
         if row_id in self.checked_rows:
             self.checked_rows.remove(row_id)
-            values[0] = "☐"
         else:
             self.checked_rows.add(row_id)
-            values[0] = "☑"
-        self.tree.item(row_id, values=values)
+        self._render_tree()
 
     def _queue_checked_retries(self) -> None:
-        row_ids = [row_id for row_id in self.tree.get_children() if row_id in self.checked_rows]
+        row_ids = [row_id for row_id in self.row_order if row_id in self.checked_rows]
         self._queue_retry_rows(row_ids, "재다운로드할 항목을 체크해주세요.")
 
     def _retry_deferred_items(self) -> None:
         row_ids = [
             row_id
-            for row_id in self.tree.get_children()
+            for row_id in self.row_order
             if self._row_status(row_id) in DEFERRED_RETRY_STATUSES
         ]
         self._queue_retry_rows(row_ids, "재다운로드할 보류/오류 항목이 없습니다.")
@@ -543,8 +609,9 @@ class DownloaderApp:
         for row_id in row_ids:
             self._set_row_checked(row_id, False)
             if row_id in self.queued_retry_rows:
-                self.tree.move(row_id, "", "end")
-                self._refresh_row_stripes()
+                if row_id in self.row_order:
+                    self.row_order.remove(row_id)
+                    self.row_order.append(row_id)
                 self._set_item_status(row_id, "대기열에 다시 추가됨")
 
         if added <= 0:
@@ -584,7 +651,7 @@ class DownloaderApp:
     def _error_rows(self) -> list[str]:
         return [
             row_id
-            for row_id in self.tree.get_children()
+            for row_id in self.row_order
             if self._row_status(row_id) in ERROR_STATUSES
         ]
 
@@ -600,24 +667,22 @@ class DownloaderApp:
             self.events.put(("log", f"기훈이한테 이르기 실패: {exc}"))
 
     def _row_status(self, row_id: str) -> str:
+        record = self.row_records.get(row_id)
+        if record:
+            return str(record.get("status", ""))
         if not self.tree.exists(row_id):
             return ""
         values = list(self.tree.item(row_id, "values"))
         return str(values[4]) if len(values) >= 5 else ""
 
     def _set_row_checked(self, row_id: str, checked: bool) -> None:
-        if not self.tree.exists(row_id):
-            return
-        values = list(self.tree.item(row_id, "values"))
-        if not values:
+        if row_id not in self.row_records:
             return
         if checked:
             self.checked_rows.add(row_id)
-            values[0] = "☑"
         else:
             self.checked_rows.discard(row_id)
-            values[0] = "☐"
-        self.tree.item(row_id, values=values)
+        self._render_tree()
 
     def _extend_progress_total(self, amount: int) -> None:
         if not hasattr(self, "progress") or amount <= 0:
@@ -729,6 +794,7 @@ class DownloaderApp:
 
         result_status = "재다운완료" if output.repaired else "완료"
         self._record_session(result_status, "재다운로드", merged, output_path=str(output.path))
+        self.events.put(("output_path", row_id, str(output.path)))
         self.events.put(("item_status", row_id, result_status))
         self.events.put(("log", f"재다운로드 저장 완료: {output.path}"))
 
@@ -766,6 +832,8 @@ class DownloaderApp:
             "quality": self.quality_var.get(),
             "date_basis": self.date_basis_var.get(),
             "file_date": item.date_label(self.date_basis_var.get()) if item else "",
+            "playwright_fallback_count": self.playwright_fallback_count,
+            "retry_policy": "network/timeout/HTTP 5xx up to 3, HTTP 429 delayed retry, HTTP 403 one fallback, HTTP 404 no retry",
         }
         try:
             error_path = save_error_case(item, stage, exc, context)
@@ -790,14 +858,15 @@ class DownloaderApp:
         if not self.session_log:
             return
         try:
-            self.session_log.add(
-                status=status,
-                stage=stage,
-                item=item,
-                message=message,
-                output_path=output_path,
-                error_path=error_path,
-            )
+            with self.session_lock:
+                self.session_log.add(
+                    status=status,
+                    stage=stage,
+                    item=item,
+                    message=message,
+                    output_path=output_path,
+                    error_path=error_path,
+                )
         except OSError:
             pass
 
@@ -820,6 +889,13 @@ class DownloaderApp:
         self._save_current_config()
         self.run_summary = self._build_run_summary()
         self.session_log = SessionLog(self.run_summary)
+        self.run_started_at = time.monotonic()
+        self.playwright_fallback_count = 0
+        self.notification_shown = False
+        self.file_progress_var.set("현재 파일: 계산 중")
+        self.speed_var.set("속도: 계산 중")
+        self.eta_var.set("남은 시간: 계산 중")
+        self.summary_stats_var.set("완료 0 / 오류 0 / 건너뜀 0 / Playwright 0회")
         self._set_checkpoint(f"작업 준비: {self.run_summary}")
         self._clear_items()
         self.progress.configure(value=0, maximum=1)
@@ -847,76 +923,34 @@ class DownloaderApp:
 
             self.events.put(("progress_max", max(1, len(items))))
             failed_count = 0
-            for index, item in enumerate(items, start=1):
-                row_id = item.nidx or item.idx
-                if self.stop_event.is_set():
-                    self.events.put(("status", "중단됨"))
-                    self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
-                    return
-
-                label = item.display_title
-                position = self._item_position_text(index, len(items), item)
-                self._checkpoint(f"{self.run_summary} / {position} 상세 확인 중 / {label}")
-                self.events.put(("item_status", row_id, "상세 확인"))
-                self.events.put(("log", f"[{index}/{len(items)}] {label}"))
-
-                try:
-                    detail = client.get_media(
-                        item.nidx or item.play_url or item.idx,
-                        use_playwright_fallback=self.playwright_var.get(),
-                        log=lambda msg: self.events.put(("log", msg)),
-                    )
-                except Exception as exc:  # noqa: BLE001 - keep batch moving after one bad page.
-                    failed_count += 1
-                    category = self._save_error_case(row_id, item, "상세 확인", exc)
-                    self.events.put(("item_status", row_id, category))
-                    self.events.put(("log", f"상세 확인 오류 - 건너뜀: {label} / {exc}"))
+            parallel_count = self._normalize_parallel(self.parallel_var.get())
+            if parallel_count <= 1:
+                for index, item in enumerate(items, start=1):
+                    if self.stop_event.is_set():
+                        self.events.put(("status", "중단됨"))
+                        self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
+                        return
+                    failed_count += int(self._download_one_item(client, index, len(items), item))
                     self.events.put(("progress", index))
-                    continue
-
-                if detail.country_code and detail.country_code != "410":
-                    self._record_session("한국 아님", "상세 확인", detail, "한국 광고가 아니어서 제외")
-                    self.events.put(("item_status", row_id, "한국 아님"))
-                    self.events.put(("progress", index))
-                    continue
-                if detail.category_code and detail.category_code != "1":
-                    self._record_session("광고 아님", "상세 확인", detail, "광고 카테고리가 아니어서 제외")
-                    self.events.put(("item_status", row_id, "광고 아님"))
-                    self.events.put(("progress", index))
-                    continue
-
-                merged = self._merge_item(item, detail)
-                self._checkpoint(f"{self.run_summary} / {position} 다운로드 중 / {merged.display_title}")
-                self.events.put(("item_status", row_id, "다운로드"))
-                try:
-                    output = download_media(
-                        merged,
-                        self.download_dir_var.get(),
-                        self.quality_var.get(),
-                        self.date_basis_var.get(),
-                        prefer_ytdlp=self.prefer_ytdlp_var.get(),
-                        log=lambda msg: self.events.put(("log", msg)),
-                        should_stop=self.stop_event.is_set,
-                    )
-                except DownloadCancelled:
-                    self._record_session("중단됨", "다운로드", merged, "사용자 중단")
-                    self.events.put(("item_status", row_id, "중단됨"))
-                    self.events.put(("status", "중단됨"))
-                    self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
-                    return
-                except Exception as exc:  # noqa: BLE001 - skip failed item and continue.
-                    failed_count += 1
-                    category = self._save_error_case(row_id, merged, "다운로드", exc)
-                    self.events.put(("item_status", row_id, category))
-                    self.events.put(("log", f"다운로드 오류 - 건너뜀: {merged.display_title} / {exc}"))
-                    self.events.put(("progress", index))
-                    continue
-
-                result_status = "건너뜀" if output.skipped else "재다운완료" if output.repaired else "완료"
-                self._record_session(result_status, "다운로드", merged, output_path=str(output.path))
-                self.events.put(("item_status", row_id, result_status))
-                self.events.put(("log", f"저장 완료: {output.path}"))
-                self.events.put(("progress", index))
+            else:
+                self.events.put(("log", f"병렬 다운로드 {parallel_count}개로 실행합니다."))
+                completed = 0
+                with ThreadPoolExecutor(max_workers=parallel_count) as executor:
+                    future_map = {
+                        executor.submit(self._download_one_item, TVCFClient(), index, len(items), item): item
+                        for index, item in enumerate(items, start=1)
+                    }
+                    for future in as_completed(future_map):
+                        if self.stop_event.is_set():
+                            break
+                        try:
+                            failed_count += int(future.result())
+                        except DownloadCancelled:
+                            self.events.put(("status", "중단됨"))
+                            self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
+                            return
+                        completed += 1
+                        self.events.put(("progress", completed))
 
             retry_failed_count = self._drain_retry_queue(client)
             failed_count += retry_failed_count
@@ -931,6 +965,68 @@ class DownloaderApp:
             self.events.put(("status", "오류"))
             self.events.put(("log", f"오류: {exc}"))
             self.events.put(("log", f"마지막 작업: {self.last_checkpoint}"))
+
+    def _download_one_item(self, client: TVCFClient, index: int, total: int, item: MediaItem) -> bool:
+        row_id = item.nidx or item.idx or item.mcode
+        if self.stop_event.is_set():
+            raise DownloadCancelled("사용자 중단 요청")
+
+        label = item.display_title
+        position = self._item_position_text(index, total, item)
+        self._checkpoint(f"{self.run_summary} / {position} 상세 확인 중 / {label}")
+        self.events.put(("item_status", row_id, "상세 확인"))
+        self.events.put(("log", f"[{index}/{total}] {label}"))
+
+        try:
+            detail = client.get_media(
+                item.nidx or item.play_url or item.idx,
+                use_playwright_fallback=self.playwright_var.get(),
+                log=lambda msg: self.events.put(("log", msg)),
+            )
+        except Exception as exc:  # noqa: BLE001 - keep batch moving after one bad page.
+            category = self._save_error_case(row_id, item, "상세 확인", exc)
+            self.events.put(("item_status", row_id, category))
+            self.events.put(("log", f"상세 확인 오류 - 건너뜀: {label} / {exc}"))
+            return True
+
+        if detail.country_code and detail.country_code != "410":
+            self._record_session("한국 아님", "상세 확인", detail, "한국 광고가 아니어서 제외")
+            self.events.put(("item_status", row_id, "한국 아님"))
+            return False
+        if detail.category_code and detail.category_code != "1":
+            self._record_session("광고 아님", "상세 확인", detail, "광고 카테고리가 아니어서 제외")
+            self.events.put(("item_status", row_id, "광고 아님"))
+            return False
+
+        merged = self._merge_item(item, detail)
+        self._checkpoint(f"{self.run_summary} / {position} 다운로드 중 / {merged.display_title}")
+        self.events.put(("item_status", row_id, "다운로드"))
+        try:
+            output = download_media(
+                merged,
+                self.download_dir_var.get(),
+                self.quality_var.get(),
+                self.date_basis_var.get(),
+                prefer_ytdlp=self.prefer_ytdlp_var.get(),
+                log=lambda msg: self.events.put(("log", msg)),
+                should_stop=self.stop_event.is_set,
+            )
+        except DownloadCancelled:
+            self._record_session("중단됨", "다운로드", merged, "사용자 중단")
+            self.events.put(("item_status", row_id, "중단됨"))
+            raise
+        except Exception as exc:  # noqa: BLE001 - skip failed item and continue.
+            category = self._save_error_case(row_id, merged, "다운로드", exc)
+            self.events.put(("item_status", row_id, category))
+            self.events.put(("log", f"다운로드 오류 - 건너뜀: {merged.display_title} / {exc}"))
+            return True
+
+        result_status = "건너뜀" if output.skipped else "재다운완료" if output.repaired else "완료"
+        self._record_session(result_status, "다운로드", merged, output_path=str(output.path))
+        self.events.put(("output_path", row_id, str(output.path)))
+        self.events.put(("item_status", row_id, result_status))
+        self.events.put(("log", f"저장 완료: {output.path}"))
+        return False
 
     def _build_items(self, client: TVCFClient) -> list[MediaItem]:
         if self.mode_var.get() == "period":
@@ -1026,6 +1122,7 @@ class DownloaderApp:
         elif kind == "status":
             self._set_status(event[1])
             self._log(event[1])
+            self._maybe_show_completion_dialog(event[1])
         elif kind == "items":
             self.items = event[1]
             self._show_items(self.items)
@@ -1048,47 +1145,104 @@ class DownloaderApp:
             self._set_checkpoint(event[1])
         elif kind == "error_case":
             self.error_case_by_id[event[1]] = event[2]
+        elif kind == "output_path":
+            self._set_row_output_path(event[1], event[2])
 
     def _show_items(self, items: list[MediaItem]) -> None:
-        self._clear_tree()
         self.item_by_id = {}
+        self.row_records = {}
+        self.row_order = []
         for row_index, item in enumerate(items):
-            item_id = item.nidx or item.idx
+            item_id = item.nidx or item.idx or item.mcode
+            if not item_id:
+                continue
             self.item_by_id[item_id] = item
+            self.row_order.append(item_id)
+            self.row_records[item_id] = {
+                "item": item,
+                "date": item.date_label(self.date_basis_var.get()),
+                "title": item.display_title,
+                "id": item_id,
+                "status": "대기",
+                "saved_path": "",
+                "row_index": row_index,
+            }
+        self._render_tree()
+
+    def _render_tree(self) -> None:
+        if not hasattr(self, "tree"):
+            return
+        self._clear_tree()
+        visible_index = 0
+        for row_id in self.row_order:
+            record = self.row_records.get(row_id)
+            if not record or not self._record_matches_filters(record):
+                continue
+            status = record.get("status", "대기")
             self.tree.insert(
                 "",
                 "end",
-                iid=item_id,
+                iid=row_id,
                 values=(
-                    "☐",
-                    item.date_label(self.date_basis_var.get()),
-                    item.display_title,
-                    item_id,
-                    "대기",
+                    "☑" if row_id in self.checked_rows else "☐",
+                    record.get("date", ""),
+                    record.get("title", ""),
+                    record.get("id", row_id),
+                    status,
                 ),
-                tags=("even" if row_index % 2 else "odd", "skip"),
+                tags=self._row_tags(status, visible_index),
             )
+            visible_index += 1
+        self._update_summary_stats()
+
+    def _record_matches_filters(self, record: dict) -> bool:
+        status_filter = self.status_filter_var.get()
+        status = str(record.get("status", ""))
+        if status_filter != "전체":
+            if status_filter == "완료" and status not in DONE_STATUSES:
+                return False
+            if status_filter == "오류" and status not in ERROR_STATUSES:
+                return False
+            if status_filter == "다운로드 중" and status not in ACTIVE_STATUSES:
+                return False
+            if status_filter in {"보류", "중단됨", "건너뜀"} and status != status_filter:
+                return False
+
+        keyword = self.search_var.get().strip().casefold()
+        if not keyword:
+            return True
+        haystack = " ".join(
+            str(record.get(key, ""))
+            for key in ("date", "title", "id", "status", "saved_path")
+        ).casefold()
+        return keyword in haystack
+
+    def _row_tags(self, status: str, row_index: int) -> tuple[str, ...]:
+        base = "even" if row_index % 2 else "odd"
+        status_tag = self._status_tag(status)
+        return (base, status_tag) if status_tag else (base,)
 
     def _set_item_status(self, item_id: str, status: str) -> None:
-        if not item_id or not self.tree.exists(item_id):
+        if not item_id:
             return
-        values = list(self.tree.item(item_id, "values"))
-        if len(values) >= 5:
-            values[4] = status
-            base_tags = [tag for tag in self.tree.item(item_id, "tags") if tag in ("odd", "even")]
-            status_tag = self._status_tag(status)
-            tags = tuple(base_tags + ([status_tag] if status_tag else []))
-            self.tree.item(item_id, values=values, tags=tags)
+        record = self.row_records.get(item_id)
+        if record:
+            record["status"] = status
+        if self.tree.exists(item_id):
+            values = list(self.tree.item(item_id, "values"))
+            if len(values) >= 5:
+                values[4] = status
+                self.tree.item(item_id, values=values, tags=self._row_tags(status, self.tree.index(item_id)))
+        self._render_tree()
 
     def _refresh_row_stripes(self) -> None:
-        for row_index, row_id in enumerate(self.tree.get_children()):
-            tags = [tag for tag in self.tree.item(row_id, "tags") if tag not in ("odd", "even")]
-            tags.insert(0, "even" if row_index % 2 else "odd")
-            self.tree.item(row_id, tags=tuple(tags))
+        self._render_tree()
 
     def _clear_items(self) -> None:
         self.items = []
         self.item_by_id = {}
+        self.row_records = {}
+        self.row_order = []
         self.checked_rows.clear()
         self.error_case_by_id.clear()
         with self.retry_lock:
@@ -1107,6 +1261,10 @@ class DownloaderApp:
 
     def _log(self, message: str) -> None:
         message = str(message)
+        self._parse_download_metrics(message)
+        if "Playwright fallback 사용" in message:
+            self.playwright_fallback_count += 1
+            self._update_summary_stats()
         timestamp = datetime.now().strftime("%H:%M:%S")
         level = self._log_level(message)
         self.log_text.insert("end", f"[{timestamp}]  ", "time")
@@ -1121,6 +1279,95 @@ class DownloaderApp:
         if any(word in message for word in ("제외", "없습니다", "손상", "삭제", "경고")):
             return "warn"
         return "info"
+
+    def _parse_download_metrics(self, message: str) -> None:
+        now = time.monotonic()
+        if now - self.last_metric_update < 0.35:
+            return
+
+        yt_match = re.search(
+            r"\[download\]\s+(?P<percent>\d+(?:\.\d+)?)%.*?(?:at\s+(?P<speed>\S+/s))?.*?(?:ETA\s+(?P<eta>\S+))?",
+            message,
+        )
+        if yt_match:
+            self.file_progress_var.set(f"현재 파일: {yt_match.group('percent')}%")
+            if yt_match.group("speed"):
+                self.speed_var.set(f"속도: {yt_match.group('speed')}")
+            if yt_match.group("eta"):
+                self.eta_var.set(f"남은 시간: {yt_match.group('eta')}")
+            self.last_metric_update = now
+            return
+
+        ffmpeg_speed = re.search(r"\bspeed=\s*(\S+)", message)
+        if ffmpeg_speed:
+            self.file_progress_var.set("현재 파일: 계산 중")
+            self.speed_var.set(f"속도: {ffmpeg_speed.group(1)}")
+            self.last_metric_update = now
+
+    def _set_row_output_path(self, row_id: str, path: str) -> None:
+        record = self.row_records.get(row_id)
+        if record:
+            record["saved_path"] = path
+            self._render_tree()
+
+    def _clear_search(self) -> None:
+        self.search_var.set("")
+        self._render_tree()
+
+    def _open_download_dir(self) -> None:
+        path = Path(self.download_dir_var.get().strip())
+        if not path.exists() or not path.is_dir():
+            messagebox.showwarning("저장 폴더 열기", "저장 경로가 없거나 존재하지 않습니다.")
+            return
+        try:
+            os.startfile(str(path))
+        except OSError as exc:
+            messagebox.showerror("저장 폴더 열기", f"저장 폴더를 열 수 없습니다.\n{exc}")
+
+    def _update_summary_stats(self) -> None:
+        statuses = [str(record.get("status", "")) for record in self.row_records.values()]
+        done = sum(1 for status in statuses if status in DONE_STATUSES)
+        errors = sum(1 for status in statuses if status in ERROR_STATUSES)
+        skipped = sum(1 for status in statuses if status == "건너뜀")
+        total = len(statuses)
+        processed = done + errors + skipped + sum(1 for status in statuses if status in {"한국 아님", "광고 아님"})
+        self.summary_stats_var.set(
+            f"완료 {done} / 오류 {errors} / 건너뜀 {skipped} / Playwright {self.playwright_fallback_count}회"
+        )
+        if total > 0 and processed > 0 and self.run_started_at:
+            elapsed = max(1.0, time.monotonic() - self.run_started_at)
+            remaining = max(0, total - processed)
+            seconds = int(elapsed / processed * remaining)
+            self.eta_var.set(f"남은 시간: {self._format_seconds(seconds)}")
+
+    @staticmethod
+    def _format_seconds(seconds: int) -> str:
+        if seconds <= 0:
+            return "0초"
+        minutes, sec = divmod(seconds, 60)
+        hours, minute = divmod(minutes, 60)
+        if hours:
+            return f"{hours}시간 {minute}분"
+        if minute:
+            return f"{minute}분 {sec}초"
+        return f"{sec}초"
+
+    def _maybe_show_completion_dialog(self, status: str) -> None:
+        if self.notification_shown or not self.notify_var.get():
+            return
+        if not (status.startswith("다운로드 완료") or status.startswith("재다운로드 완료")):
+            return
+        self.notification_shown = True
+        statuses = [str(record.get("status", "")) for record in self.row_records.values()]
+        done = sum(1 for value in statuses if value in DONE_STATUSES)
+        errors = sum(1 for value in statuses if value in ERROR_STATUSES)
+        skipped = sum(1 for value in statuses if value == "건너뜀")
+        open_folder = messagebox.askyesno(
+            "작업 완료",
+            f"작업이 완료되었습니다.\n\n완료: {done}개\n오류: {errors}개\n건너뜀: {skipped}개\n\n저장 폴더를 열까요?",
+        )
+        if open_folder:
+            self._open_download_dir()
 
     def _checkpoint(self, message: str) -> None:
         self.last_checkpoint = message
@@ -1171,6 +1418,19 @@ class DownloaderApp:
             return "error"
         return ""
 
+    @staticmethod
+    def _normalize_quality(value: object) -> str:
+        text = str(value or "").strip()
+        return text if text in QUALITY_OPTIONS else "가능한 최고화질"
+
+    @staticmethod
+    def _normalize_parallel(value: object) -> int:
+        try:
+            number = int(value)
+        except (TypeError, ValueError):
+            return 1
+        return min(3, max(1, number))
+
     def _sync_wraplength(self, event: object | None = None) -> None:
         if not hasattr(self, "current_task_label"):
             return
@@ -1184,12 +1444,14 @@ class DownloaderApp:
             return (
                 f"{self.date_from_var.get()}~{self.date_to_var.get()} / "
                 f"기준 {self.date_basis_var.get()} / 화질 {self.quality_var.get()} / "
-                f"페이지 {max_pages_label} / 저장 {self.download_dir_var.get()}"
+                f"페이지 {max_pages_label} / 병렬 {self._normalize_parallel(self.parallel_var.get())} / "
+                f"저장 {self.download_dir_var.get()}"
             )
 
         return (
             f"ID {self.id_start_var.get()}~{self.id_end_var.get() or self.id_start_var.get()} / "
-            f"화질 {self.quality_var.get()} / 저장 {self.download_dir_var.get()}"
+            f"화질 {self.quality_var.get()} / 병렬 {self._normalize_parallel(self.parallel_var.get())} / "
+            f"저장 {self.download_dir_var.get()}"
         )
 
     def _item_position_text(self, index: int, total: int, item: MediaItem) -> str:
@@ -1216,6 +1478,8 @@ class DownloaderApp:
                 "id_end": self.id_end_var.get(),
                 "quality": self.quality_var.get(),
                 "max_pages": self.max_pages_var.get(),
+                "parallel_downloads": self._normalize_parallel(self.parallel_var.get()),
+                "notify_on_complete": self.notify_var.get(),
                 "prefer_ytdlp": self.prefer_ytdlp_var.get(),
                 "use_playwright_fallback": self.playwright_var.get(),
                 "last_checkpoint": self.last_checkpoint,

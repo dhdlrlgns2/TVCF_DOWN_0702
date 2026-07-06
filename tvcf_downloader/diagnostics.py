@@ -31,6 +31,14 @@ def classify_error(stage: str, exc: BaseException | str) -> str:
 
     if "스트림" in message and ("없" in message or "찾지" in message):
         return "스트림 없음"
+    if "HTTP 404" in message:
+        return "상세 오류"
+    if "HTTP 403" in message:
+        return "접근 거부"
+    if "HTTP 429" in message:
+        return "요청 제한"
+    if any(f"HTTP {code}" in message for code in ("500", "502", "503", "504")):
+        return "네트워크 오류"
     if any(marker.lower() in lower for marker in NETWORK_MARKERS):
         return "네트워크 오류"
     if "yt-dlp" in lower or "youtube" in lower:

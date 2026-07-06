@@ -12,6 +12,7 @@ from urllib.request import Request, urlopen
 
 from .config import PROJECT_ROOT
 from .ffmpeg_manager import ensure_ffmpeg
+from .history import find_record, record_download, valid_record_path
 from .models import MediaItem
 
 
@@ -35,6 +36,7 @@ class DownloadResult:
     path: Path
     skipped: bool = False
     repaired: bool = False
+    history_skipped: bool = False
 
 
 YTDLP_EXE = PROJECT_ROOT / "bin" / "yt-dlp.exe"
@@ -161,6 +163,11 @@ def cleanup_stale_download_files(output_path: Path) -> None:
 
 
 def choose_stream(item: MediaItem, quality: str) -> str:
+    if quality in {"가능한 최고화질", "best", "BEST"}:
+        for fallback in ("HD", "SD", "mobile", "stream", "youtube", "urf", "url", "extSrc"):
+            if fallback in item.stream_urls and item.stream_urls[fallback]:
+                return item.stream_urls[fallback]
+
     if quality in item.stream_urls and item.stream_urls[quality]:
         return item.stream_urls[quality]
     for fallback in ("HD", "SD", "mobile", "stream", "youtube", "urf", "url", "extSrc"):
@@ -226,6 +233,15 @@ def download_media(
     youtube_source = is_youtube_url(stream_url)
     repaired = False
 
+    if not force:
+        record = find_record(item)
+        if record:
+            history_path = valid_record_path(record, lambda path: is_valid_media_file(path, ffprobe))
+            if history_path:
+                if log:
+                    safe_log(log, f"다운로드 이력에 정상 파일이 있어 건너뜁니다: {history_path}")
+                return DownloadResult(history_path, skipped=True, history_skipped=True)
+
     if output_path.exists():
         if force:
             if log:
@@ -235,6 +251,7 @@ def download_media(
         elif is_valid_media_file(output_path, ffprobe):
             if log:
                 safe_log(log, f"이미 정상 파일이 있어 건너뜁니다: {output_path}")
+            record_download(item, output_path, quality, "건너뜀")
             return DownloadResult(output_path, skipped=True)
         else:
             if log:
@@ -253,11 +270,16 @@ def download_media(
                     safe_log(log, "yt-dlp로 다운로드 시도")
                 _download_with_ytdlp(ytdlp_cmd, stream_url, output_path, item, ffmpeg, log, should_stop)
                 verify_downloaded_file(output_path, ffprobe)
+                record_download(item, output_path, quality, "완료")
                 return DownloadResult(output_path, repaired=repaired)
             except DownloadError as exc:
                 if isinstance(exc, DownloadCancelled):
                     raise
                 errors.append(str(exc))
+                if output_path.exists() and not is_valid_media_file(output_path, ffprobe):
+                    if log:
+                        safe_log(log, "yt-dlp 결과 파일이 손상되어 삭제합니다.")
+                    output_path.unlink()
         elif log:
             safe_log(log, "yt-dlp를 찾지 못해 ffmpeg로 진행합니다.")
 
@@ -265,16 +287,28 @@ def download_media(
         raise DownloadError("유튜브 원본 영상은 yt-dlp가 필요합니다.")
 
     if ffmpeg:
-        try:
-            if log:
-                safe_log(log, "ffmpeg로 다운로드 시도")
-            _download_with_ffmpeg(ffmpeg, stream_url, output_path, item, log, should_stop)
-            verify_downloaded_file(output_path, ffprobe)
-            return DownloadResult(output_path, repaired=repaired)
-        except DownloadError as exc:
-            if isinstance(exc, DownloadCancelled):
-                raise
-            errors.append(str(exc))
+        for attempt in range(1, 3):
+            try:
+                if log:
+                    suffix = "" if attempt == 1 else " (손상 파일 재시도)"
+                    safe_log(log, f"ffmpeg로 다운로드 시도{suffix}")
+                _download_with_ffmpeg(ffmpeg, stream_url, output_path, item, log, should_stop)
+                verify_downloaded_file(output_path, ffprobe)
+                record_download(item, output_path, quality, "완료")
+                return DownloadResult(output_path, repaired=repaired)
+            except DownloadError as exc:
+                if isinstance(exc, DownloadCancelled):
+                    raise
+                message = str(exc)
+                if attempt == 1 and ("손상" in message or "확인할 수 없습니다" in message):
+                    if output_path.exists():
+                        output_path.unlink()
+                    cleanup_stale_download_files(output_path)
+                    if log:
+                        safe_log(log, "[재시도 2/2] 파일 손상으로 다시 다운로드합니다.")
+                    continue
+                errors.append(message)
+                break
 
     raise DownloadError("; ".join(errors))
 

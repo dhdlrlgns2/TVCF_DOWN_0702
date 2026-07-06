@@ -8,9 +8,11 @@ CONFIG_PATH = PROJECT_ROOT / "config.json"
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "download_dir": str(PROJECT_ROOT / "downloads"),
-    "quality": "HD",
+    "quality": "가능한 최고화질",
     "date_basis": "published",
     "max_pages": 0,
+    "parallel_downloads": 1,
+    "notify_on_complete": True,
     "prefer_ytdlp": True,
     "use_playwright_fallback": True,
     "last_checkpoint": "작업 없음",

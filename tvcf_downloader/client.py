@@ -1,11 +1,12 @@
 import json
 import re
+import subprocess
 import time
 from datetime import date
 from http.client import IncompleteRead
 from html import unescape
 from typing import Any, Callable, Dict, Iterable, List, Optional
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
 
@@ -35,12 +36,19 @@ class TVCFClient:
     def __init__(self, timeout: int = 25, delay: float = 0.3) -> None:
         self.timeout = timeout
         self.delay = delay
+        self.playwright_attempted_urls: set[str] = set()
         self.headers = {
             "User-Agent": self.USER_AGENT,
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.6,en;q=0.5",
         }
 
-    def list_page(self, page: int, rows: int = 50, sort_by: str = "registrated_date") -> List[MediaItem]:
+    def list_page(
+        self,
+        page: int,
+        rows: int = 50,
+        sort_by: str = "registrated_date",
+        log: LogCallback = None,
+    ) -> List[MediaItem]:
         params = {
             "country_code_value": "410",
             "lang": "ko",
@@ -49,7 +57,7 @@ class TVCFClient:
             "rows": str(rows),
             "sort_by": sort_by,
         }
-        html = self._get_text(f"{self.BASE_URL}/worked/video", params=params)
+        html = self._get_text(f"{self.BASE_URL}/worked/video", params=params, log=log)
         return self.parse_list_page(html)
 
     def collect_period(
@@ -74,7 +82,7 @@ class TVCFClient:
             if log:
                 log(f"목록 {page}페이지 확인 중")
 
-            page_items = self.list_page(page, sort_by=sort_by)
+            page_items = self.list_page(page, sort_by=sort_by, log=log)
             if not page_items:
                 if log:
                     log("목록에서 더 이상 항목을 찾지 못했습니다.")
@@ -145,9 +153,14 @@ class TVCFClient:
         errors: List[str] = []
         for url in self._candidate_urls(identifier):
             try:
-                html = self._get_text(url)
+                html = self._get_text(url, log=log)
                 item = self.parse_play_page(html, url)
                 if item.stream_urls:
+                    return item
+
+                streams = self.sniff_streams_with_ytdlp(url, log=log)
+                if streams:
+                    item.stream_urls = streams
                     return item
 
                 if use_playwright_fallback:
@@ -161,6 +174,47 @@ class TVCFClient:
                 errors.append(f"{url}: {exc}")
 
         raise TVCFError("; ".join(errors) if errors else "미디어를 찾지 못했습니다.")
+
+    def sniff_streams_with_ytdlp(self, url: str, log: LogCallback = None) -> Dict[str, str]:
+        try:
+            from .downloader import resolve_ytdlp
+
+            cmd = [
+                *resolve_ytdlp(log=None),
+                "--no-warnings",
+                "--no-playlist",
+                "--get-url",
+                url,
+            ]
+            process = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=self.timeout,
+            )
+        except Exception as exc:  # noqa: BLE001 - probing is an optional fallback.
+            if log:
+                log(f"yt-dlp 스트림 해석 실패: {exc}")
+            return {}
+
+        if process.returncode != 0:
+            return {}
+
+        streams: Dict[str, str] = {}
+        for line in process.stdout.splitlines():
+            value = line.strip()
+            if not value.startswith("http"):
+                continue
+            key = "youtube" if "youtube.com/" in value or "youtu.be/" in value else "stream"
+            if ".m3u8" in value and "720p" in value:
+                key = "HD"
+            streams.setdefault(key, value)
+
+        if streams and log:
+            log("yt-dlp로 스트림 URL을 해석했습니다.")
+        return streams
 
     def parse_list_page(self, html: str) -> List[MediaItem]:
         structured_items = self._items_from_next_flight(html)
@@ -285,23 +339,26 @@ class TVCFClient:
         return ""
 
     def parse_play_page(self, html: str, page_url: str) -> MediaItem:
+        flight_text = "".join(self._next_flight_strings(html))
+        initial_obj = self._json_object_after_key(flight_text, "initialData")
+        media_obj = self._json_object_after_key(flight_text, "mediaData")
         initial = self._slice_after(html, r'\\"initialData\\":{', 40000)
         media = self._slice_after(html, r'\\"mediaData\\":{', 50000)
         scope = initial + media
 
-        streams = self._extract_streams(scope or html)
+        streams = self._extract_streams_from_objects(initial_obj, media_obj) or self._extract_streams(scope or html)
         item = MediaItem(
-            idx=self._field(initial, "idx") or self._field(media, "mIdx"),
-            nidx=self._field(initial, "nidx") or self._slug_from_url(page_url),
-            mcode=self._field(initial, "mcode") or self._field(media, "mCode"),
-            title=self._field(initial, "title") or self._field(media, "title"),
-            chapter=self._field(initial, "chapter") or self._field(media, "chapter"),
-            brand=self._field(initial, "brand"),
-            published_date=self._field(initial, "publishedDate"),
-            registered_date=self._field(initial, "registratedDate"),
-            country_code=self._field(initial, "countryCode") or self._field(initial, "country_code"),
-            category_code=self._field(initial, "categoryCode") or self._array_first(initial, "category_code"),
-            category_name=self._field(initial, "categoryCodeName") or self._field(initial, "category_code_name"),
+            idx=self._object_field(initial_obj, "idx") or self._object_field(media_obj, "mIdx") or self._field(initial, "idx") or self._field(media, "mIdx"),
+            nidx=self._object_field(initial_obj, "nidx") or self._slug_from_url(page_url),
+            mcode=self._object_field(initial_obj, "mcode") or self._object_field(media_obj, "mCode") or self._field(initial, "mcode") or self._field(media, "mCode"),
+            title=self._object_field(initial_obj, "title") or self._object_field(media_obj, "title") or self._field(initial, "title") or self._field(media, "title"),
+            chapter=self._object_field(initial_obj, "chapter") or self._object_field(media_obj, "chapter") or self._field(initial, "chapter") or self._field(media, "chapter"),
+            brand=self._object_field(initial_obj, "brand") or self._field(initial, "brand"),
+            published_date=self._object_field(initial_obj, "publishedDate") or self._field(initial, "publishedDate"),
+            registered_date=self._object_field(initial_obj, "registratedDate") or self._field(initial, "registratedDate"),
+            country_code=self._object_field(initial_obj, "countryCode") or self._object_field(initial_obj, "country_code") or self._field(initial, "countryCode") or self._field(initial, "country_code"),
+            category_code=self._object_field(initial_obj, "categoryCode") or self._object_field(initial_obj, "category_code") or self._field(initial, "categoryCode") or self._array_first(initial, "category_code"),
+            category_name=self._object_field(initial_obj, "categoryCodeName") or self._object_field(initial_obj, "category_code_name") or self._field(initial, "categoryCodeName") or self._field(initial, "category_code_name"),
             play_url=page_url,
             source_page=page_url,
             stream_urls=streams,
@@ -316,6 +373,12 @@ class TVCFClient:
         return item
 
     def sniff_streams_with_playwright(self, url: str, log: LogCallback = None) -> Dict[str, str]:
+        if url in self.playwright_attempted_urls:
+            if log:
+                log("Playwright fallback은 이미 시도한 항목이라 건너뜁니다.")
+            return {}
+        self.playwright_attempted_urls.add(url)
+
         try:
             from playwright.sync_api import sync_playwright
         except ImportError:
@@ -325,6 +388,8 @@ class TVCFClient:
 
         found: Dict[str, str] = {}
         try:
+            if log:
+                log("Playwright fallback 사용")
             with sync_playwright() as playwright:
                 browser = playwright.chromium.launch(headless=True)
                 page = browser.new_page(user_agent=self.USER_AGENT)
@@ -345,13 +410,15 @@ class TVCFClient:
 
         return found
 
-    def _get_text(self, url: str, params: Optional[dict] = None) -> str:
+    def _get_text(self, url: str, params: Optional[dict] = None, log: LogCallback = None) -> str:
         if params:
             separator = "&" if "?" in url else "?"
             url = f"{url}{separator}{urlencode(params)}"
 
         last_error: Exception | None = None
-        for attempt in range(1, 4):
+        attempt = 1
+        max_attempts = 3
+        while attempt <= max_attempts:
             request = Request(url, headers=self.headers)
             try:
                 with urlopen(request, timeout=self.timeout) as response:
@@ -367,12 +434,45 @@ class TVCFClient:
                     if match:
                         encoding = match.group(1)
                     return raw.decode(encoding, errors="replace")
-            except (IncompleteRead, TimeoutError, URLError, OSError) as exc:
+            except (HTTPError, IncompleteRead, TimeoutError, URLError, OSError) as exc:
                 last_error = exc
-                if attempt < 3:
-                    time.sleep(0.8 * attempt)
+                max_attempts, wait_seconds, reason = self._retry_policy(exc)
+                if attempt < max_attempts:
+                    if log:
+                        log(f"[재시도 {attempt + 1}/{max_attempts}] {reason}로 다시 시도합니다.")
+                    time.sleep(wait_seconds * attempt)
+                attempt += 1
 
-        raise last_error or TVCFError(f"페이지를 읽지 못했습니다: {url}")
+        if last_error:
+            raise TVCFError(
+                f"페이지를 읽지 못했습니다: {url} / "
+                f"원인={self._retry_reason(last_error)} / 재시도={max(0, attempt - 2)}회 / {last_error}"
+            ) from last_error
+        raise TVCFError(f"페이지를 읽지 못했습니다: {url}")
+
+    @staticmethod
+    def _retry_policy(exc: Exception) -> tuple[int, float, str]:
+        if isinstance(exc, HTTPError):
+            if exc.code == 404:
+                return 1, 0.0, "HTTP 404"
+            if exc.code == 403:
+                return 2, 1.0, "HTTP 403"
+            if exc.code == 429:
+                return 3, 3.0, "HTTP 429"
+            if 500 <= exc.code <= 599:
+                return 3, 1.2, f"HTTP {exc.code}"
+            return 2, 1.0, f"HTTP {exc.code}"
+        if isinstance(exc, TimeoutError):
+            return 3, 1.0, "timeout"
+        if isinstance(exc, IncompleteRead):
+            return 3, 1.0, "네트워크 오류"
+        if isinstance(exc, (URLError, OSError)):
+            return 3, 1.0, "네트워크 오류"
+        return 1, 0.0, "알 수 없는 오류"
+
+    @classmethod
+    def _retry_reason(cls, exc: Exception) -> str:
+        return cls._retry_policy(exc)[2]
 
     def _item_from_list_block(self, block: str) -> MediaItem:
         category_code = self._array_first(block, "category_code")
@@ -417,6 +517,58 @@ class TVCFClient:
             play_url=urljoin(self.BASE_URL, f"/play/{nidx}") if nidx else "",
             source_page=urljoin(self.BASE_URL, f"/play/{nidx}") if nidx else "",
         )
+
+    def _json_object_after_key(self, text: str, key: str) -> dict[str, Any]:
+        if not text:
+            return {}
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*\{{', text)
+        if not match:
+            return {}
+        start = text.find("{", match.start())
+        object_text = self._balanced_json_slice(text, start, "{", "}")
+        if not object_text:
+            return {}
+        try:
+            value = json.loads(object_text)
+        except json.JSONDecodeError:
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def _extract_streams_from_objects(self, *objects: dict[str, Any]) -> Dict[str, str]:
+        streams: Dict[str, str] = {}
+        for obj in objects:
+            if not obj:
+                continue
+            for quality in ("HD", "SD", "mobile", "urf", "url", "extSrc"):
+                value = self._object_field(obj, quality)
+                if value and value.startswith("http"):
+                    clean_value = self._clean_url(value)
+                    key = "youtube" if "youtu.be/" in clean_value or "youtube.com/" in clean_value else quality
+                    streams[key] = clean_value
+        return streams
+
+    def _object_field(self, obj: dict[str, Any], key: str) -> str:
+        if not obj:
+            return ""
+        value = obj.get(key)
+        if value is None:
+            value = self._find_nested_value(obj, key)
+        return self._string_value(self._first_value(value))
+
+    def _find_nested_value(self, value: Any, key: str) -> Any:
+        if isinstance(value, dict):
+            if key in value:
+                return value[key]
+            for child in value.values():
+                found = self._find_nested_value(child, key)
+                if found is not None:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = self._find_nested_value(child, key)
+                if found is not None:
+                    return found
+        return None
 
     @staticmethod
     def _first_value(value: Any) -> Any:

@@ -7,6 +7,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REPO_URL = "https://github.com/dhdlrlgns2/TVCF_DOWN_0702.git"
 BRANCH = "main"
+CORE_FILES = ("main.py", "requirements.txt", "tvcf_downloader/gui.py", "tvcf_downloader/client.py")
 
 
 def run_git(args: list[str], check: bool = False) -> subprocess.CompletedProcess[str]:
@@ -132,6 +133,29 @@ def ahead_behind(upstream: str) -> tuple[int, int]:
     return int(left), int(right)
 
 
+def current_head() -> str:
+    result = run_git(["rev-parse", "HEAD"])
+    return result.stdout.strip() if result.returncode == 0 else ""
+
+
+def core_files_ok() -> bool:
+    return all((PROJECT_ROOT / name).is_file() for name in CORE_FILES)
+
+
+def rollback_to(head: str) -> bool:
+    if not head:
+        return False
+    print(f"[UPDATE] Rolling back to previous version {head[:12]}...")
+    reset = run_git(["reset", "--hard", head])
+    if reset.returncode != 0:
+        print("[UPDATE] Rollback failed.")
+        if reset.stderr.strip():
+            print(reset.stderr.strip())
+        return False
+    print("[UPDATE] Rollback complete. Starting previous version.")
+    return True
+
+
 def check_and_update() -> int:
     if not git_available():
         print("[UPDATE] Git is not installed. Skipping update check.")
@@ -172,6 +196,10 @@ def check_and_update() -> int:
         print("[UPDATE] Local branch has commits not on upstream. Skipping auto update.")
         return 0
 
+    previous_head = current_head()
+    if previous_head:
+        print(f"[UPDATE] Current version: {previous_head[:12]}")
+
     print(f"[UPDATE] Applying {behind} update(s)...")
     pull = run_git(["pull", "--ff-only"])
     if pull.returncode != 0:
@@ -179,6 +207,13 @@ def check_and_update() -> int:
         if pull.stderr.strip():
             print(pull.stderr.strip())
         return 0
+
+    if not core_files_ok():
+        print("[UPDATE] Update completed but required files are missing.")
+        if rollback_to(previous_head):
+            return 0
+        print("[UPDATE] Required files are missing and rollback failed.")
+        return 1
 
     print("[UPDATE] Update complete.")
     if pull.stdout.strip():

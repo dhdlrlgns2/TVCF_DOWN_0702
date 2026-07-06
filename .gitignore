@@ -7,6 +7,8 @@ __pycache__/
 
 config.json
 github_issue_token.json
+download_history.json
+download_history.broken_*.json
 downloads/
 logs/
 *.zip
