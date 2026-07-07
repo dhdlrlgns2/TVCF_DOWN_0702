@@ -140,6 +140,8 @@ class DownloaderApp:
         self.completion_actions_ran = False
         self.stop_requested_by_user = False
         self.last_metric_update = 0.0
+        self.last_ffmpeg_size_bytes: float | None = None
+        self.last_ffmpeg_size_at = 0.0
         self.log_line_count = 0
         self.last_checkpoint_save_at = 0.0
 
@@ -166,7 +168,6 @@ class DownloaderApp:
         self.status_badge_var = StringVar(value="● 대기 중")
         self.current_task_var = StringVar(value=self.last_checkpoint)
         self.progress_text_var = StringVar(value="0 / 0 (0%)")
-        self.file_progress_var = StringVar(value="현재 파일: 계산 중")
         self.speed_var = StringVar(value="속도: 계산 중")
         self.elapsed_time_var = StringVar(value="경과 시간: 0초")
         self.eta_var = StringVar(value="남은 시간: 계산 중")
@@ -623,12 +624,11 @@ class DownloaderApp:
         ttk.Label(card, textvariable=self.progress_text_var, style="ProgressCount.TLabel").grid(row=0, column=2, sticky="e", padx=(18, 18), pady=13)
         metrics = ttk.Frame(card, style="Surface.TFrame")
         metrics.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 18), pady=(0, 12))
-        metrics.columnconfigure(4, weight=1)
-        ttk.Label(metrics, textvariable=self.file_progress_var, style="SurfaceMuted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 18))
-        ttk.Label(metrics, textvariable=self.speed_var, style="SurfaceMuted.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 18))
-        ttk.Label(metrics, textvariable=self.elapsed_time_var, style="SurfaceMuted.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 18))
-        ttk.Label(metrics, textvariable=self.eta_var, style="SurfaceMuted.TLabel").grid(row=0, column=3, sticky="w", padx=(0, 18))
-        ttk.Label(metrics, textvariable=self.summary_stats_var, style="SurfaceMuted.TLabel").grid(row=0, column=4, sticky="e")
+        metrics.columnconfigure(3, weight=1)
+        ttk.Label(metrics, textvariable=self.speed_var, style="SurfaceMuted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 18))
+        ttk.Label(metrics, textvariable=self.elapsed_time_var, style="SurfaceMuted.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 18))
+        ttk.Label(metrics, textvariable=self.eta_var, style="SurfaceMuted.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 18))
+        ttk.Label(metrics, textvariable=self.summary_stats_var, style="SurfaceMuted.TLabel").grid(row=0, column=3, sticky="e")
 
     def _card(
         self,
@@ -800,6 +800,7 @@ class DownloaderApp:
         self.run_started_at = time.monotonic()
         self.progress.configure(value=0, maximum=max(1, added))
         self._set_progress_text(0, added)
+        self._reset_speed_metrics()
         self.elapsed_time_var.set("경과 시간: 0초")
         self._log(f"재다운로드 대기열에 {added}개 항목을 추가했습니다.")
         self._set_status("재다운로드 대기열 실행 중")
@@ -1191,8 +1192,7 @@ class DownloaderApp:
         self.run_started_at = time.monotonic()
         self.playwright_fallback_count = 0
         self.completion_actions_ran = False
-        self.file_progress_var.set("현재 파일: 계산 중")
-        self.speed_var.set("속도: 계산 중")
+        self._reset_speed_metrics()
         self.elapsed_time_var.set("경과 시간: 0초")
         self.eta_var.set("남은 시간: 계산 중")
         self.summary_stats_var.set("완료 0 / 오류 0 / 건너뜀 0 / Playwright 0회")
@@ -1740,8 +1740,7 @@ class DownloaderApp:
         self.status_filter_var.set("전체")
         self.progress.configure(value=0, maximum=1)
         self._set_progress_text(0, 0)
-        self.file_progress_var.set("현재 파일: 계산 중")
-        self.speed_var.set("속도: 계산 중")
+        self._reset_speed_metrics()
         self.elapsed_time_var.set("경과 시간: 0초")
         self.eta_var.set("남은 시간: 계산 중")
         self.summary_stats_var.set("완료 0 / 오류 0 / 건너뜀 0 / Playwright 0회")
@@ -1786,27 +1785,73 @@ class DownloaderApp:
 
     def _parse_download_metrics(self, message: str) -> None:
         now = time.monotonic()
-        if now - self.last_metric_update < 0.35:
-            return
+        can_update = now - self.last_metric_update >= 0.35
 
         yt_match = re.search(
             r"\[download\]\s+(?P<percent>\d+(?:\.\d+)?)%.*?(?:at\s+(?P<speed>\S+/s))?.*?(?:ETA\s+(?P<eta>\S+))?",
             message,
         )
         if yt_match:
-            self.file_progress_var.set(f"현재 파일: {yt_match.group('percent')}%")
-            if yt_match.group("speed"):
-                self.speed_var.set(f"속도: {yt_match.group('speed')}")
-            if yt_match.group("eta"):
-                self.eta_var.set(f"남은 시간: {yt_match.group('eta')}")
-            self.last_metric_update = now
+            if can_update:
+                if yt_match.group("speed"):
+                    self.speed_var.set(f"속도: {yt_match.group('speed')}")
+                if yt_match.group("eta"):
+                    self.eta_var.set(f"남은 시간: {yt_match.group('eta')}")
+                self.last_metric_update = now
             return
 
-        ffmpeg_speed = re.search(r"\bspeed=\s*(\S+)", message)
-        if ffmpeg_speed:
-            self.file_progress_var.set("현재 파일: 계산 중")
-            self.speed_var.set(f"속도: {ffmpeg_speed.group(1)}")
+        ffmpeg_size = re.search(r"\bL?size=\s*(?P<size>\d+(?:\.\d+)?)\s*(?P<unit>[KMG]?i?B|[KMG]?B)", message)
+        if not ffmpeg_size:
+            return
+
+        size_bytes = self._parse_size_bytes(ffmpeg_size.group("size"), ffmpeg_size.group("unit"))
+        if size_bytes is None:
+            return
+
+        last_size = self.last_ffmpeg_size_bytes
+        last_at = self.last_ffmpeg_size_at
+        self.last_ffmpeg_size_bytes = size_bytes
+        self.last_ffmpeg_size_at = now
+
+        if last_size is None or last_at <= 0 or size_bytes <= last_size:
+            return
+
+        bytes_per_second = (size_bytes - last_size) / max(0.001, now - last_at)
+        if can_update and bytes_per_second > 0:
+            self.speed_var.set(f"속도: {self._format_bytes_per_second(bytes_per_second)}")
             self.last_metric_update = now
+
+    def _reset_speed_metrics(self) -> None:
+        self.last_metric_update = 0.0
+        self.last_ffmpeg_size_bytes = None
+        self.last_ffmpeg_size_at = 0.0
+        self.speed_var.set("속도: 계산 중")
+
+    @staticmethod
+    def _parse_size_bytes(value: str, unit: str) -> float | None:
+        try:
+            number = float(value)
+        except ValueError:
+            return None
+        multipliers = {
+            "B": 1,
+            "KB": 1000,
+            "MB": 1000**2,
+            "GB": 1000**3,
+            "KiB": 1024,
+            "MiB": 1024**2,
+            "GiB": 1024**3,
+        }
+        multiplier = multipliers.get(unit)
+        return number * multiplier if multiplier else None
+
+    @staticmethod
+    def _format_bytes_per_second(bytes_per_second: float) -> str:
+        if bytes_per_second >= 1024**2:
+            return f"{bytes_per_second / 1024**2:.2f} MiB/s"
+        if bytes_per_second >= 1024:
+            return f"{bytes_per_second / 1024:.1f} KiB/s"
+        return f"{bytes_per_second:.0f} B/s"
 
     def _set_row_output_path(self, row_id: str, path: str) -> None:
         record = self.row_records.get(row_id)
