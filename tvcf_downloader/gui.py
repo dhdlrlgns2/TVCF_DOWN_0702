@@ -166,7 +166,7 @@ class DownloaderApp:
         self.status_var = StringVar(value="대기 중")
         self.status_badge_var = StringVar(value="● 대기 중")
         self.current_task_var = StringVar(value=self.last_checkpoint)
-        self.progress_text_var = StringVar(value="0 / 0")
+        self.progress_text_var = StringVar(value="0 / 0 (0%)")
         self.file_progress_var = StringVar(value="현재 파일: 계산 중")
         self.speed_var = StringVar(value="속도: 계산 중")
         self.eta_var = StringVar(value="남은 시간: 계산 중")
@@ -797,7 +797,7 @@ class DownloaderApp:
         self.run_summary = f"재다운로드 대기열 / {added}개"
         self._set_checkpoint(f"재다운로드 대기열 준비: {self.run_summary}")
         self.progress.configure(value=0, maximum=max(1, added))
-        self.progress_text_var.set(f"0 / {added}")
+        self._set_progress_text(0, added)
         self._log(f"재다운로드 대기열에 {added}개 항목을 추가했습니다.")
         self._set_status("재다운로드 대기열 실행 중")
         options = self._download_options_snapshot()
@@ -1190,7 +1190,7 @@ class DownloaderApp:
         self._set_checkpoint(f"작업 준비: {self.run_summary}")
         self._clear_items()
         self.progress.configure(value=0, maximum=1)
-        self.progress_text_var.set("0 / 0")
+        self._set_progress_text(0, 0)
         self._set_status("작업 준비 중")
 
         options = self._download_options_snapshot()
@@ -1603,7 +1603,7 @@ class DownloaderApp:
         self.search_var.set("")
         self.status_filter_var.set("전체")
         self.progress.configure(value=0, maximum=1)
-        self.progress_text_var.set("0 / 0")
+        self._set_progress_text(0, 0)
         self.file_progress_var.set("현재 파일: 계산 중")
         self.speed_var.set("속도: 계산 중")
         self.eta_var.set("남은 시간: 계산 중")
@@ -1802,9 +1802,11 @@ class DownloaderApp:
 
     def _set_progress_text(self, value: int, maximum: int) -> None:
         if maximum <= 0:
-            self.progress_text_var.set("0 / 0")
+            self.progress_text_var.set("0 / 0 (0%)")
             return
-        self.progress_text_var.set(f"{min(value, maximum)} / {maximum}")
+        current = min(max(0, value), maximum)
+        percent = current / maximum * 100
+        self.progress_text_var.set(f"{current} / {maximum} ({percent:.1f}%)")
 
     def _set_status(self, status: str) -> None:
         self.status_var.set(status)
