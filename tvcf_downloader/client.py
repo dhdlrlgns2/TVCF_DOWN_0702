@@ -38,10 +38,34 @@ class TVCFClient:
         self.timeout = timeout
         self.delay = delay
         self.playwright_attempted_urls: set[str] = set()
+        self._playwright = None
+        self._browser = None
         self.headers = {
             "User-Agent": self.USER_AGENT,
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.6,en;q=0.5",
         }
+
+    def close(self) -> None:
+        browser = self._browser
+        playwright = self._playwright
+        self._browser = None
+        self._playwright = None
+        if browser:
+            try:
+                browser.close()
+            except Exception:
+                pass
+        if playwright:
+            try:
+                playwright.stop()
+            except Exception:
+                pass
+
+    def __enter__(self) -> "TVCFClient":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
 
     def list_page(
         self,
@@ -386,28 +410,40 @@ class TVCFClient:
             return {}
 
         found: Dict[str, str] = {}
+        page = None
         try:
             if log:
                 log("Playwright fallback 사용")
-            with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
-                page = browser.new_page(user_agent=self.USER_AGENT)
+            browser = self._playwright_browser(sync_playwright)
+            page = browser.new_page(user_agent=self.USER_AGENT)
 
-                def on_request(request) -> None:
-                    req_url = request.url
-                    if ".m3u8" in req_url:
-                        key = "HD" if "720p" in req_url else "stream"
-                        found.setdefault(key, req_url)
+            def on_request(request) -> None:
+                req_url = request.url
+                if ".m3u8" in req_url:
+                    key = "HD" if "720p" in req_url else "stream"
+                    found.setdefault(key, req_url)
 
-                page.on("request", on_request)
-                page.goto(url, wait_until="networkidle", timeout=self.timeout * 1000)
-                page.wait_for_timeout(2500)
-                browser.close()
+            page.on("request", on_request)
+            page.goto(url, wait_until="networkidle", timeout=self.timeout * 1000)
+            page.wait_for_timeout(2500)
         except Exception as exc:  # noqa: BLE001 - fallback should be quiet.
             if log:
                 log(f"Playwright fallback 실패: {exc}")
+        finally:
+            if page:
+                try:
+                    page.close()
+                except Exception:
+                    pass
 
         return found
+
+    def _playwright_browser(self, sync_playwright):
+        if self._browser:
+            return self._browser
+        self._playwright = sync_playwright().start()
+        self._browser = self._playwright.chromium.launch(headless=True)
+        return self._browser
 
     def _get_text(self, url: str, params: Optional[dict] = None, log: LogCallback = None) -> str:
         if params:

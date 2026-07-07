@@ -4,7 +4,6 @@ import re
 import subprocess
 import threading
 import time
-from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from collections import deque
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -869,6 +868,7 @@ class DownloaderApp:
         self._set_progress_text(current, new_maximum)
 
     def _retry_queue_worker_run(self, options: dict[str, object]) -> None:
+        client: TVCFClient | None = None
         try:
             client = TVCFClient()
             self.events.put(("log", "다운로드 도구 확인 중"))
@@ -890,6 +890,8 @@ class DownloaderApp:
             self.events.put(("status", "재다운로드 오류"))
             self.events.put(("log", f"재다운로드 대기열 실패: {exc}"))
         finally:
+            if client:
+                client.close()
             flush_history()
 
     def _drain_retry_queue(self, client: TVCFClient, options: dict[str, object]) -> int:
@@ -1210,6 +1212,7 @@ class DownloaderApp:
         }
 
     def _worker_run(self, download: bool, options: dict[str, object]) -> None:
+        client: TVCFClient | None = None
         try:
             client = TVCFClient()
             items = self._build_items(client, options)
@@ -1259,6 +1262,8 @@ class DownloaderApp:
             self.events.put(("log", f"오류: {exc}"))
             self.events.put(("log", f"마지막 작업: {self.last_checkpoint}"))
         finally:
+            if client:
+                client.close()
             flush_history()
 
     def _download_items_parallel(self, items: list[MediaItem], parallel_count: int, options: dict[str, object]) -> int:
@@ -1266,53 +1271,56 @@ class DownloaderApp:
         failed_count = 0
         completed = 0
         next_index = 0
-        in_flight: dict[Future, int] = {}
+        index_lock = threading.Lock()
+        result_lock = threading.Lock()
 
-        def submit_next(executor: ThreadPoolExecutor) -> None:
+        def next_item() -> tuple[int, MediaItem] | None:
             nonlocal next_index
-            if next_index >= len(items) or self.stop_event.is_set():
-                return
-            item_index = next_index + 1
-            item = items[next_index]
-            future = executor.submit(
-                self._download_one_item,
-                TVCFClient(),
-                item_index,
-                len(items),
-                item,
-                options,
-            )
-            in_flight[future] = item_index
-            next_index += 1
+            with index_lock:
+                if next_index >= len(items) or self.stop_event.is_set():
+                    return None
+                item_index = next_index + 1
+                item = items[next_index]
+                next_index += 1
+                return item_index, item
 
-        with ThreadPoolExecutor(max_workers=parallel_count) as executor:
-            for _ in range(parallel_count):
-                submit_next(executor)
-
-            while in_flight:
-                if self.stop_event.is_set():
-                    for future in in_flight:
-                        future.cancel()
-                    self.events.put(("status", "중단됨"))
-                    self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
-                    return failed_count
-
-                done, _pending = wait(in_flight, timeout=0.2, return_when=FIRST_COMPLETED)
-                if not done:
-                    continue
-
-                for future in done:
-                    in_flight.pop(future, None)
+        def worker_loop() -> None:
+            nonlocal completed, failed_count
+            client = TVCFClient()
+            try:
+                while True:
+                    task = next_item()
+                    if task is None:
+                        return
+                    item_index, item = task
                     try:
-                        failed_count += int(future.result())
+                        failed = self._download_one_item(client, item_index, len(items), item, options)
                     except DownloadCancelled:
                         self.stop_event.set()
                         self.events.put(("status", "중단됨"))
                         self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
-                        return failed_count
-                    completed += 1
-                    self.events.put(("progress", completed))
-                    submit_next(executor)
+                        return
+                    except Exception as exc:  # noqa: BLE001 - keep other workers from disappearing silently.
+                        row_id = item.nidx or item.idx or item.mcode
+                        category = self._save_error_case(row_id, item, "병렬 작업", exc, options)
+                        self.events.put(("item_status", row_id, category))
+                        self.events.put(("log", f"병렬 작업 오류 - 건너뜀: {item.display_title} / {exc}"))
+                        failed = True
+                    with result_lock:
+                        failed_count += int(failed)
+                        completed += 1
+                        self.events.put(("progress", completed))
+            finally:
+                client.close()
+
+        workers = [
+            threading.Thread(target=worker_loop, daemon=True)
+            for _ in range(min(parallel_count, len(items)))
+        ]
+        for worker in workers:
+            worker.start()
+        for worker in workers:
+            worker.join()
 
         return failed_count
 
