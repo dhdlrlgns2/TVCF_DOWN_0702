@@ -168,6 +168,7 @@ class DownloaderApp:
         self.progress_text_var = StringVar(value="0 / 0 (0%)")
         self.file_progress_var = StringVar(value="현재 파일: 계산 중")
         self.speed_var = StringVar(value="속도: 계산 중")
+        self.elapsed_time_var = StringVar(value="경과 시간: 0초")
         self.eta_var = StringVar(value="남은 시간: 계산 중")
         self.summary_stats_var = StringVar(value="완료 0 / 오류 0 / 건너뜀 0 / Playwright 0회")
 
@@ -622,11 +623,12 @@ class DownloaderApp:
         ttk.Label(card, textvariable=self.progress_text_var, style="ProgressCount.TLabel").grid(row=0, column=2, sticky="e", padx=(18, 18), pady=13)
         metrics = ttk.Frame(card, style="Surface.TFrame")
         metrics.grid(row=1, column=1, columnspan=2, sticky="ew", padx=(0, 18), pady=(0, 12))
-        metrics.columnconfigure(3, weight=1)
+        metrics.columnconfigure(4, weight=1)
         ttk.Label(metrics, textvariable=self.file_progress_var, style="SurfaceMuted.TLabel").grid(row=0, column=0, sticky="w", padx=(0, 18))
         ttk.Label(metrics, textvariable=self.speed_var, style="SurfaceMuted.TLabel").grid(row=0, column=1, sticky="w", padx=(0, 18))
-        ttk.Label(metrics, textvariable=self.eta_var, style="SurfaceMuted.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 18))
-        ttk.Label(metrics, textvariable=self.summary_stats_var, style="SurfaceMuted.TLabel").grid(row=0, column=3, sticky="e")
+        ttk.Label(metrics, textvariable=self.elapsed_time_var, style="SurfaceMuted.TLabel").grid(row=0, column=2, sticky="w", padx=(0, 18))
+        ttk.Label(metrics, textvariable=self.eta_var, style="SurfaceMuted.TLabel").grid(row=0, column=3, sticky="w", padx=(0, 18))
+        ttk.Label(metrics, textvariable=self.summary_stats_var, style="SurfaceMuted.TLabel").grid(row=0, column=4, sticky="e")
 
     def _card(
         self,
@@ -795,8 +797,10 @@ class DownloaderApp:
         self._save_current_config()
         self.run_summary = f"재다운로드 대기열 / {added}개"
         self._set_checkpoint(f"재다운로드 대기열 준비: {self.run_summary}")
+        self.run_started_at = time.monotonic()
         self.progress.configure(value=0, maximum=max(1, added))
         self._set_progress_text(0, added)
+        self.elapsed_time_var.set("경과 시간: 0초")
         self._log(f"재다운로드 대기열에 {added}개 항목을 추가했습니다.")
         self._set_status("재다운로드 대기열 실행 중")
         options = self._download_options_snapshot()
@@ -1189,12 +1193,14 @@ class DownloaderApp:
         self.completion_actions_ran = False
         self.file_progress_var.set("현재 파일: 계산 중")
         self.speed_var.set("속도: 계산 중")
+        self.elapsed_time_var.set("경과 시간: 0초")
         self.eta_var.set("남은 시간: 계산 중")
         self.summary_stats_var.set("완료 0 / 오류 0 / 건너뜀 0 / Playwright 0회")
         self._set_checkpoint(f"작업 준비: {self.run_summary}")
         self._clear_items()
         self.progress.configure(value=0, maximum=1)
         self._set_progress_text(0, 0)
+        self.elapsed_time_var.set("경과 시간: 0초")
         self._set_status("작업 준비 중")
 
         options = self._download_options_snapshot()
@@ -1574,6 +1580,7 @@ class DownloaderApp:
             self._handle_event(event)
             processed += 1
 
+        self._update_elapsed_time()
         delay = 20 if processed >= MAX_GUI_EVENTS_PER_TICK else 120
         self.root.after(delay, self._poll_events)
 
@@ -1584,6 +1591,8 @@ class DownloaderApp:
         elif kind == "status":
             self._set_status(event[1])
             self._log(event[1])
+            if self._is_terminal_status(event[1]):
+                self._update_elapsed_time(force=True)
             if self._is_completion_status(event[1]):
                 self.root.after(250, lambda status=event[1]: self._maybe_run_completion_actions(status))
         elif kind == "items":
@@ -1733,6 +1742,7 @@ class DownloaderApp:
         self._set_progress_text(0, 0)
         self.file_progress_var.set("현재 파일: 계산 중")
         self.speed_var.set("속도: 계산 중")
+        self.elapsed_time_var.set("경과 시간: 0초")
         self.eta_var.set("남은 시간: 계산 중")
         self.summary_stats_var.set("완료 0 / 오류 0 / 건너뜀 0 / Playwright 0회")
         self._set_checkpoint("다운로드 목록을 지웠습니다.")
@@ -1835,6 +1845,15 @@ class DownloaderApp:
             seconds = int(elapsed / processed * remaining)
             self.eta_var.set(f"남은 시간: {self._format_seconds(seconds)}")
 
+    def _update_elapsed_time(self, force: bool = False) -> None:
+        if not self.run_started_at:
+            self.elapsed_time_var.set("경과 시간: 0초")
+            return
+        if not force and not (self.worker and self.worker.is_alive()):
+            return
+        elapsed = max(0, int(time.monotonic() - self.run_started_at))
+        self.elapsed_time_var.set(f"경과 시간: {self._format_seconds(elapsed)}")
+
     @staticmethod
     def _format_seconds(seconds: int) -> str:
         if seconds <= 0:
@@ -1850,6 +1869,15 @@ class DownloaderApp:
     @staticmethod
     def _is_completion_status(status: str) -> bool:
         return status.startswith("다운로드 완료") or status.startswith("재다운로드 완료")
+
+    @staticmethod
+    def _is_terminal_status(status: str) -> bool:
+        return (
+            status.startswith("다운로드 완료")
+            or status.startswith("재다운로드 완료")
+            or status.startswith("대상 확인 완료")
+            or status in {"대상 없음", "중단됨", "오류", "재다운로드 오류"}
+        )
 
     def _maybe_run_completion_actions(self, status: str) -> None:
         if self.completion_actions_ran or not self._is_completion_status(status):
