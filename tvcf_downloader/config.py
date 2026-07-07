@@ -11,7 +11,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     "quality": "가능한 최고화질",
     "date_basis": "published",
     "max_pages": 0,
-    "parallel_downloads": 1,
+    "parallel_downloads": 3,
     "completion_actions": {
         "notify": "off",
         "open_folder": "off",
@@ -19,6 +19,7 @@ DEFAULT_CONFIG: Dict[str, Any] = {
     },
     "prefer_ytdlp": True,
     "use_playwright_fallback": True,
+    "fast_verify": True,
     "last_checkpoint": "작업 없음",
 }
 

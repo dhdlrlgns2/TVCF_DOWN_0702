@@ -53,6 +53,7 @@ YTDLP_EXE = PROJECT_ROOT / "bin" / "yt-dlp.exe"
 YTDLP_MANIFEST_PATH = PROJECT_ROOT / "bin" / "yt-dlp_manifest.json"
 YTDLP_DOWNLOAD_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 YTDLP_UPDATE_DAYS = 7
+YTDLP_CONCURRENT_FRAGMENTS = 4
 _VALIDATION_CACHE: dict[tuple[str, int, int, str], bool] = {}
 _VALIDATION_LOCK = threading.Lock()
 
@@ -142,7 +143,19 @@ def is_valid_media_file(path: Path, ffprobe: str) -> bool:
     return valid
 
 
-def verify_downloaded_file(path: Path, ffprobe: str) -> None:
+def is_downloaded_file_present(path: Path) -> bool:
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    return stat.st_size >= 1024
+
+
+def verify_downloaded_file(path: Path, ffprobe: str, quick: bool = False) -> None:
+    if quick:
+        if not is_downloaded_file_present(path):
+            raise DownloadError(f"다운로드 결과 파일이 비어 있거나 너무 작습니다: {path}")
+        return
     if not is_valid_media_file(path, ffprobe):
         raise DownloadError(f"다운로드 결과 파일이 손상되었거나 확인할 수 없습니다: {path}")
 
@@ -239,6 +252,7 @@ def download_media(
     should_stop: StopCallback = None,
     force: bool = False,
     tools: DownloadTools | None = None,
+    fast_verify: bool = True,
 ) -> DownloadResult:
     Path(download_dir).mkdir(parents=True, exist_ok=True)
     stream_url = choose_stream(item, quality)
@@ -247,6 +261,7 @@ def download_media(
     ffmpeg = tools.ffmpeg
     ffprobe = tools.ffprobe
     youtube_source = is_youtube_url(stream_url)
+    hls_source = is_hls_url(stream_url)
     repaired = False
 
     if not force:
@@ -278,44 +293,54 @@ def download_media(
     cleanup_stale_download_files(output_path)
 
     errors = []
-    if prefer_ytdlp or youtube_source:
+
+    def finish_download(method: str) -> DownloadResult:
+        if log:
+            verify_label = "빠른 검증" if fast_verify else "정밀 검증"
+            safe_log(log, f"{method} 결과 파일 {verify_label} 중")
+        verify_downloaded_file(output_path, ffprobe, quick=fast_verify)
+        record_download(item, output_path, quality, "완료")
+        return DownloadResult(output_path, repaired=repaired)
+
+    def delete_invalid_output(method: str) -> None:
+        if output_path.exists() and not is_valid_media_file(output_path, ffprobe):
+            if log:
+                safe_log(log, f"{method} 결과 파일이 손상되어 삭제합니다.")
+            output_path.unlink()
+
+    def try_ytdlp(method_label: str = "yt-dlp") -> DownloadResult | None:
         ytdlp_cmd = tools.ytdlp_cmd or resolve_ytdlp(log=log)
         if ytdlp_cmd:
             try:
                 if log:
-                    safe_log(log, "yt-dlp로 다운로드 시도")
+                    safe_log(log, f"{method_label}로 다운로드 시도")
                 _download_with_ytdlp(ytdlp_cmd, stream_url, output_path, item, ffmpeg, log, should_stop)
-                if log:
-                    safe_log(log, "다운로드 파일 검증 중")
-                verify_downloaded_file(output_path, ffprobe)
-                record_download(item, output_path, quality, "완료")
-                return DownloadResult(output_path, repaired=repaired)
+                return finish_download(method_label)
             except DownloadError as exc:
                 if isinstance(exc, DownloadCancelled):
                     raise
                 errors.append(str(exc))
-                if output_path.exists() and not is_valid_media_file(output_path, ffprobe):
-                    if log:
-                        safe_log(log, "yt-dlp 결과 파일이 손상되어 삭제합니다.")
-                    output_path.unlink()
+                delete_invalid_output(method_label)
         elif log:
             safe_log(log, "yt-dlp를 찾지 못해 ffmpeg로 진행합니다.")
+        return None
 
     if youtube_source:
+        result = try_ytdlp("yt-dlp")
+        if result:
+            return result
         raise DownloadError("유튜브 원본 영상은 yt-dlp가 필요합니다.")
 
-    if ffmpeg:
+    def try_ffmpeg(method_label: str = "ffmpeg") -> DownloadResult | None:
+        if not ffmpeg:
+            return None
         for attempt in range(1, 3):
             try:
                 if log:
                     suffix = "" if attempt == 1 else " (손상 파일 재시도)"
-                    safe_log(log, f"ffmpeg로 다운로드 시도{suffix}")
+                    safe_log(log, f"{method_label}로 다운로드 시도{suffix}")
                 _download_with_ffmpeg(ffmpeg, stream_url, output_path, item, log, should_stop)
-                if log:
-                    safe_log(log, "다운로드 파일 검증 중")
-                verify_downloaded_file(output_path, ffprobe)
-                record_download(item, output_path, quality, "완료")
-                return DownloadResult(output_path, repaired=repaired)
+                return finish_download(method_label)
             except DownloadError as exc:
                 if isinstance(exc, DownloadCancelled):
                     raise
@@ -329,6 +354,30 @@ def download_media(
                     continue
                 errors.append(message)
                 break
+        return None
+
+    if hls_source:
+        result = try_ffmpeg("ffmpeg")
+        if result:
+            return result
+        if prefer_ytdlp:
+            if log:
+                safe_log(log, "ffmpeg 실패로 yt-dlp fallback을 시도합니다.")
+            result = try_ytdlp("yt-dlp fallback")
+            if result:
+                return result
+    else:
+        if prefer_ytdlp:
+            result = try_ytdlp("yt-dlp")
+            if result:
+                return result
+        result = try_ffmpeg("ffmpeg")
+        if result:
+            return result
+        if not prefer_ytdlp:
+            result = try_ytdlp("yt-dlp fallback")
+            if result:
+                return result
 
     raise DownloadError("; ".join(errors))
 
@@ -344,6 +393,8 @@ def _download_with_ytdlp(
 ) -> None:
     cmd = [
         *ytdlp_cmd,
+        "--no-warnings",
+        "--no-playlist",
         "--force-overwrites",
         "--referer",
         item.play_url or item.source_page or "https://tvcf.co.kr/",
@@ -356,6 +407,8 @@ def _download_with_ytdlp(
         str(Path(ffmpeg).parent),
         "--merge-output-format",
         "mp4",
+        "--concurrent-fragments",
+        str(YTDLP_CONCURRENT_FRAGMENTS),
         "-o",
         str(output_path),
         stream_url,
@@ -383,6 +436,11 @@ def _download_with_ffmpeg(
     )
     cmd = [
         ffmpeg,
+        "-hide_banner",
+        "-nostdin",
+        "-loglevel",
+        "error",
+        "-stats",
         "-y",
         "-user_agent",
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -510,6 +568,10 @@ def safe_log(log: Callable[[str], None], message: str) -> None:
 
 def is_youtube_url(url: str) -> bool:
     return "youtube.com/" in url or "youtu.be/" in url
+
+
+def is_hls_url(url: str) -> bool:
+    return ".m3u8" in url.lower()
 
 
 def _download_ytdlp(log: LogCallback = None) -> Sequence[str]:
