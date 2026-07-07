@@ -105,6 +105,7 @@ MAX_GUI_EVENTS_PER_TICK = 80
 MAX_VISIBLE_LOG_LINES = 2000
 LOG_TRIM_LINES = 400
 MAX_LOG_MESSAGE_CHARS = 1200
+MEDIA_CACHE_TTL_SECONDS = 1800
 
 
 class DownloaderApp:
@@ -128,6 +129,8 @@ class DownloaderApp:
         self.retry_queue: deque[tuple[str, MediaItem]] = deque()
         self.queued_retry_rows: set[str] = set()
         self.retry_lock = threading.Lock()
+        self.media_cache: dict[str, tuple[MediaItem, float]] = {}
+        self.media_cache_lock = threading.Lock()
         self.session_lock = threading.Lock()
         self.run_summary = ""
         self.last_checkpoint = self.config.get("last_checkpoint", "작업 없음")
@@ -990,9 +993,15 @@ class DownloaderApp:
         force_playwright: bool = False,
         use_playwright: bool = True,
     ) -> MediaItem:
+        if not force_playwright:
+            cached = self._cached_media(item)
+            if cached:
+                return cached
+
         identifiers = [
             item.nidx or item.play_url or item.idx,
             item.play_url,
+            item.source_page,
             item.nidx,
             item.idx,
             item.mcode,
@@ -1003,16 +1012,93 @@ class DownloaderApp:
             if not identifier or identifier in seen:
                 continue
             seen.add(identifier)
+            if not force_playwright:
+                cached = self._cached_media(identifier)
+                if cached:
+                    return cached
             try:
-                return client.get_media(
+                detail = client.get_media(
                     identifier,
                     use_playwright_fallback=force_playwright or use_playwright,
                     log=lambda msg: self.events.put(("log", msg)),
                 )
+                self._remember_media_detail(item, detail, identifier)
+                return detail
             except Exception as exc:  # noqa: BLE001 - try another identifier.
                 errors.append(f"{identifier}: {exc}")
 
         raise TVCFError("; ".join(errors) if errors else "상세 정보를 찾지 못했습니다.")
+
+    def _get_media_detail(
+        self,
+        client: TVCFClient,
+        item: MediaItem,
+        use_playwright: bool,
+    ) -> MediaItem:
+        cached = self._cached_media(item)
+        if cached:
+            return cached
+
+        identifier = item.nidx or item.play_url or item.idx
+        detail = client.get_media(
+            identifier,
+            use_playwright_fallback=use_playwright,
+            log=lambda msg: self.events.put(("log", msg)),
+        )
+        self._remember_media_detail(item, detail, identifier)
+        return detail
+
+    def _cached_media(self, value: MediaItem | str) -> MediaItem | None:
+        now = time.monotonic()
+        keys = self._media_cache_keys(value)
+        expired: list[str] = []
+        with self.media_cache_lock:
+            for key in keys:
+                cached = self.media_cache.get(key)
+                if not cached:
+                    continue
+                item, cached_at = cached
+                if now - cached_at <= MEDIA_CACHE_TTL_SECONDS:
+                    return item
+                expired.append(key)
+            for key in expired:
+                self.media_cache.pop(key, None)
+        return None
+
+    def _remember_media_detail(self, base: MediaItem | None, detail: MediaItem, *extra_keys: str) -> None:
+        now = time.monotonic()
+        keys = [
+            *self._media_cache_keys(base),
+            *self._media_cache_keys(detail),
+            *self._media_cache_keys(*extra_keys),
+        ]
+        with self.media_cache_lock:
+            for key in keys:
+                self.media_cache[key] = (detail, now)
+
+    def _media_cache_keys(self, *values: MediaItem | str | None) -> list[str]:
+        keys: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            if value is None:
+                continue
+            candidates: list[str]
+            if isinstance(value, MediaItem):
+                candidates = [
+                    value.nidx,
+                    value.idx,
+                    value.mcode,
+                    value.play_url,
+                    value.source_page,
+                ]
+            else:
+                candidates = [str(value)]
+            for candidate in candidates:
+                key = candidate.strip()
+                if key and key not in seen:
+                    keys.append(key)
+                    seen.add(key)
+        return keys
 
     def _save_error_case(
         self,
@@ -1250,10 +1336,10 @@ class DownloaderApp:
         self.events.put(("log", f"[{index}/{total}] {label}"))
 
         try:
-            detail = client.get_media(
-                item.nidx or item.play_url or item.idx,
-                use_playwright_fallback=bool(options.get("use_playwright_fallback", True)),
-                log=lambda msg: self.events.put(("log", msg)),
+            detail = self._get_media_detail(
+                client,
+                item,
+                use_playwright=bool(options.get("use_playwright_fallback", True)),
             )
         except Exception as exc:  # noqa: BLE001 - keep batch moving after one bad page.
             category = self._save_error_case(row_id, item, "상세 확인", exc, options)
