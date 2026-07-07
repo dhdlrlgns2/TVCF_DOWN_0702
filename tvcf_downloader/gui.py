@@ -15,7 +15,8 @@ from tkinter.scrolledtext import ScrolledText
 from .client import TVCFClient, TVCFError
 from .config import PROJECT_ROOT, load_config, save_config
 from .diagnostics import SessionLog, classify_error, save_error_case
-from .downloader import DownloadCancelled, download_media
+from .downloader import DownloadCancelled, download_media, prepare_download_tools
+from .history import flush_history
 from .issue_reporter import report_error_cases
 from .models import MediaItem
 from .text_utils import decode_output
@@ -867,6 +868,12 @@ class DownloaderApp:
     def _retry_queue_worker_run(self, options: dict[str, object]) -> None:
         try:
             client = TVCFClient()
+            self.events.put(("log", "다운로드 도구 확인 중"))
+            tools = prepare_download_tools(
+                prefer_ytdlp=bool(options.get("prefer_ytdlp", True)),
+                log=lambda msg: self.events.put(("log", msg)),
+            )
+            options = {**options, "tools": tools}
             failed_count = self._drain_retry_queue(client, options)
             if failed_count:
                 self.events.put(("status", f"재다운로드 완료(오류 {failed_count}개)"))
@@ -879,6 +886,8 @@ class DownloaderApp:
         except Exception as exc:  # noqa: BLE001 - show retry failure without killing GUI.
             self.events.put(("status", "재다운로드 오류"))
             self.events.put(("log", f"재다운로드 대기열 실패: {exc}"))
+        finally:
+            flush_history()
 
     def _drain_retry_queue(self, client: TVCFClient, options: dict[str, object]) -> int:
         failed_count = 0
@@ -947,6 +956,7 @@ class DownloaderApp:
                 log=lambda msg: self.events.put(("log", msg)),
                 should_stop=self.stop_event.is_set,
                 force=True,
+                tools=options.get("tools"),
             )
         except DownloadCancelled:
             raise
@@ -964,6 +974,7 @@ class DownloaderApp:
                 log=lambda msg: self.events.put(("log", msg)),
                 should_stop=self.stop_event.is_set,
                 force=True,
+                tools=options.get("tools"),
             )
 
         result_status = "재다운완료" if output.repaired else "완료"
@@ -1131,6 +1142,12 @@ class DownloaderApp:
             self.events.put(("progress_max", max(1, len(items))))
             failed_count = 0
             parallel_count = self._normalize_parallel(options.get("parallel"))
+            self.events.put(("log", "다운로드 도구 확인 중"))
+            tools = prepare_download_tools(
+                prefer_ytdlp=bool(options.get("prefer_ytdlp", True)),
+                log=lambda msg: self.events.put(("log", msg)),
+            )
+            options = {**options, "tools": tools}
             if parallel_count <= 1:
                 for index, item in enumerate(items, start=1):
                     if self.stop_event.is_set():
@@ -1155,6 +1172,8 @@ class DownloaderApp:
             self.events.put(("status", "오류"))
             self.events.put(("log", f"오류: {exc}"))
             self.events.put(("log", f"마지막 작업: {self.last_checkpoint}"))
+        finally:
+            flush_history()
 
     def _download_items_parallel(self, items: list[MediaItem], parallel_count: int, options: dict[str, object]) -> int:
         self.events.put(("log", f"병렬 다운로드 {parallel_count}개로 실행합니다."))
@@ -1263,6 +1282,7 @@ class DownloaderApp:
                 prefer_ytdlp=bool(options.get("prefer_ytdlp", True)),
                 log=lambda msg: self.events.put(("log", msg)),
                 should_stop=self.stop_event.is_set,
+                tools=options.get("tools"),
             )
         except DownloadCancelled:
             self._record_session("중단됨", "다운로드", merged, "사용자 중단")
@@ -1851,6 +1871,7 @@ class DownloaderApp:
 
     def _on_close(self) -> None:
         self._save_current_config()
+        flush_history()
         self.stop_event.set()
         self.root.destroy()
 

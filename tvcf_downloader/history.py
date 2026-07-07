@@ -1,3 +1,4 @@
+import atexit
 import json
 import shutil
 import threading
@@ -10,14 +11,17 @@ from .models import MediaItem
 
 
 HISTORY_PATH = PROJECT_ROOT / "download_history.json"
-_HISTORY_LOCK = threading.Lock()
+_HISTORY_LOCK = threading.RLock()
+_HISTORY_CACHE: dict[str, Any] | None = None
+_HISTORY_DIRTY_COUNT = 0
+_HISTORY_FLUSH_EVERY = 10
 
 
 def tvcf_id(item: MediaItem) -> str:
     return item.nidx or item.idx or item.mcode
 
 
-def load_history() -> dict[str, Any]:
+def _load_history_from_disk() -> dict[str, Any]:
     if not HISTORY_PATH.exists():
         return {"items": {}}
     try:
@@ -38,7 +42,32 @@ def load_history() -> dict[str, Any]:
     return data
 
 
+def load_history() -> dict[str, Any]:
+    global _HISTORY_CACHE
+    with _HISTORY_LOCK:
+        if _HISTORY_CACHE is None:
+            _HISTORY_CACHE = _load_history_from_disk()
+        return _HISTORY_CACHE
+
+
 def save_history(history: dict[str, Any]) -> None:
+    global _HISTORY_CACHE, _HISTORY_DIRTY_COUNT
+    with _HISTORY_LOCK:
+        _HISTORY_CACHE = history
+        _write_history_unlocked(history)
+        _HISTORY_DIRTY_COUNT = 0
+
+
+def flush_history() -> None:
+    global _HISTORY_DIRTY_COUNT
+    with _HISTORY_LOCK:
+        if _HISTORY_CACHE is None or _HISTORY_DIRTY_COUNT <= 0:
+            return
+        _write_history_unlocked(_HISTORY_CACHE)
+        _HISTORY_DIRTY_COUNT = 0
+
+
+def _write_history_unlocked(history: dict[str, Any]) -> None:
     HISTORY_PATH.write_text(json.dumps(history, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
@@ -59,6 +88,19 @@ def valid_record_path(record: dict[str, Any], validator: Callable[[Path], bool])
     path = Path(saved_path)
     if not path.exists() or not path.is_file():
         return None
+
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+
+    if (
+        record.get("file_size") == stat.st_size
+        and record.get("file_mtime_ns") == stat.st_mtime_ns
+        and stat.st_size >= 1024
+    ):
+        return path
+
     return path if validator(path) else None
 
 
@@ -68,9 +110,12 @@ def record_download(item: MediaItem, path: Path, quality: str, status: str) -> N
         return
 
     try:
-        file_size = path.stat().st_size if path.exists() else 0
+        stat = path.stat() if path.exists() else None
+        file_size = stat.st_size if stat else 0
+        file_mtime_ns = stat.st_mtime_ns if stat else 0
     except OSError:
         file_size = 0
+        file_mtime_ns = 0
 
     with _HISTORY_LOCK:
         history = load_history()
@@ -84,6 +129,19 @@ def record_download(item: MediaItem, path: Path, quality: str, status: str) -> N
             "quality": quality,
             "status": status,
             "file_size": file_size,
+            "file_mtime_ns": file_mtime_ns,
             "completed_at": datetime.now().isoformat(timespec="seconds"),
         }
-        save_history(history)
+        _mark_history_dirty_unlocked(history)
+
+
+def _mark_history_dirty_unlocked(history: dict[str, Any]) -> None:
+    global _HISTORY_CACHE, _HISTORY_DIRTY_COUNT
+    _HISTORY_CACHE = history
+    _HISTORY_DIRTY_COUNT += 1
+    if _HISTORY_DIRTY_COUNT >= _HISTORY_FLUSH_EVERY:
+        _write_history_unlocked(history)
+        _HISTORY_DIRTY_COUNT = 0
+
+
+atexit.register(flush_history)

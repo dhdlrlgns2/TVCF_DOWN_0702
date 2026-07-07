@@ -4,6 +4,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -41,10 +42,19 @@ class DownloadResult:
     history_skipped: bool = False
 
 
+@dataclass(frozen=True)
+class DownloadTools:
+    ffmpeg: str
+    ffprobe: str
+    ytdlp_cmd: Sequence[str] | None = None
+
+
 YTDLP_EXE = PROJECT_ROOT / "bin" / "yt-dlp.exe"
 YTDLP_MANIFEST_PATH = PROJECT_ROOT / "bin" / "yt-dlp_manifest.json"
 YTDLP_DOWNLOAD_URL = "https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp.exe"
 YTDLP_UPDATE_DAYS = 7
+_VALIDATION_CACHE: dict[tuple[str, int, int, str], bool] = {}
+_VALIDATION_LOCK = threading.Lock()
 
 
 def clean_filename(text: str, max_length: int = 120) -> str:
@@ -84,30 +94,24 @@ def resolve_ffprobe(ffmpeg: str) -> str:
 
 
 def is_valid_media_file(path: Path, ffprobe: str) -> bool:
-    if not path.exists() or path.stat().st_size < 1024:
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+
+    if stat.st_size < 1024:
         return False
     if not ffprobe:
         return True
 
+    cache_key = (str(path.resolve()), stat.st_size, stat.st_mtime_ns, ffprobe)
+    with _VALIDATION_LOCK:
+        cached = _VALIDATION_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
     try:
-        duration_process = subprocess.run(
-            [
-                ffprobe,
-                "-v",
-                "error",
-                "-show_entries",
-                "format=duration",
-                "-of",
-                "default=noprint_wrappers=1:nokey=1",
-                str(path),
-            ],
-            capture_output=True,
-            env=subprocess_env(),
-            timeout=20,
-            check=True,
-        )
-        duration = decode_output(duration_process.stdout).strip()
-        has_video_process = subprocess.run(
+        process = subprocess.run(
             [
                 ffprobe,
                 "-v",
@@ -115,9 +119,9 @@ def is_valid_media_file(path: Path, ffprobe: str) -> bool:
                 "-select_streams",
                 "v:0",
                 "-show_entries",
-                "stream=codec_type",
+                "stream=codec_type:format=duration",
                 "-of",
-                "csv=p=0",
+                "json",
                 str(path),
             ],
             capture_output=True,
@@ -125,14 +129,17 @@ def is_valid_media_file(path: Path, ffprobe: str) -> bool:
             timeout=20,
             check=True,
         )
-        has_video = decode_output(has_video_process.stdout).strip()
-    except (OSError, subprocess.SubprocessError, ValueError):
-        return False
+        payload = json.loads(decode_output(process.stdout))
+        duration = str(payload.get("format", {}).get("duration", "")).strip()
+        streams = payload.get("streams", [])
+        has_video = any(isinstance(stream, dict) and stream.get("codec_type") == "video" for stream in streams)
+        valid = float(duration) > 0 and has_video
+    except (OSError, subprocess.SubprocessError, ValueError, json.JSONDecodeError, TypeError):
+        valid = False
 
-    try:
-        return float(duration) > 0 and "video" in has_video.lower()
-    except ValueError:
-        return False
+    with _VALIDATION_LOCK:
+        _VALIDATION_CACHE[cache_key] = valid
+    return valid
 
 
 def verify_downloaded_file(path: Path, ffprobe: str) -> None:
@@ -215,6 +222,13 @@ def ensure_ytdlp(log: LogCallback = None, max_age_days: int = YTDLP_UPDATE_DAYS)
         return [str(YTDLP_EXE)]
 
 
+def prepare_download_tools(prefer_ytdlp: bool = True, log: LogCallback = None) -> DownloadTools:
+    ffmpeg = ensure_ffmpeg(log=log)
+    ffprobe = resolve_ffprobe(ffmpeg)
+    ytdlp_cmd = resolve_ytdlp(log=log) if prefer_ytdlp else None
+    return DownloadTools(ffmpeg=ffmpeg, ffprobe=ffprobe, ytdlp_cmd=ytdlp_cmd)
+
+
 def download_media(
     item: MediaItem,
     download_dir: str,
@@ -224,12 +238,14 @@ def download_media(
     log: LogCallback = None,
     should_stop: StopCallback = None,
     force: bool = False,
+    tools: DownloadTools | None = None,
 ) -> DownloadResult:
     Path(download_dir).mkdir(parents=True, exist_ok=True)
     stream_url = choose_stream(item, quality)
     output_path = build_output_path(item, download_dir, date_basis)
-    ffmpeg = ensure_ffmpeg(log=log)
-    ffprobe = resolve_ffprobe(ffmpeg)
+    tools = tools or prepare_download_tools(prefer_ytdlp=prefer_ytdlp, log=log)
+    ffmpeg = tools.ffmpeg
+    ffprobe = tools.ffprobe
     youtube_source = is_youtube_url(stream_url)
     repaired = False
 
@@ -263,7 +279,7 @@ def download_media(
 
     errors = []
     if prefer_ytdlp or youtube_source:
-        ytdlp_cmd = resolve_ytdlp(log=log)
+        ytdlp_cmd = tools.ytdlp_cmd or resolve_ytdlp(log=log)
         if ytdlp_cmd:
             try:
                 if log:
