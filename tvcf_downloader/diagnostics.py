@@ -105,13 +105,18 @@ def save_error_case(
 
 
 class SessionLog:
+    FLUSH_EVERY = 20
+
     def __init__(self, run_summary: str) -> None:
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
         self.started_at = datetime.now()
         self.session_id = self.started_at.strftime("%Y%m%d_%H%M%S")
         self.run_summary = run_summary
-        self.records: list[dict[str, Any]] = []
-        self.path = SESSION_DIR / f"{self.session_id}.json"
+        self.record_count = 0
+        self._dirty_count = 0
+        self.path = SESSION_DIR / f"{self.session_id}.jsonl"
+        self.meta_path = SESSION_DIR / f"{self.session_id}.json"
+        self._stream = self.path.open("a", encoding="utf-8")
         self.save()
 
     def add(
@@ -123,18 +128,20 @@ class SessionLog:
         output_path: str = "",
         error_path: str = "",
     ) -> None:
-        self.records.append(
-            {
-                "time": datetime.now().isoformat(timespec="seconds"),
-                "status": status,
-                "stage": stage,
-                "message": message,
-                "output_path": output_path,
-                "error_path": error_path,
-                "item": item_to_dict(item),
-            }
-        )
-        self.save()
+        record = {
+            "time": datetime.now().isoformat(timespec="seconds"),
+            "status": status,
+            "stage": stage,
+            "message": message,
+            "output_path": output_path,
+            "error_path": error_path,
+            "item": item_to_dict(item),
+        }
+        self._stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+        self.record_count += 1
+        self._dirty_count += 1
+        if self._dirty_count >= self.FLUSH_EVERY:
+            self.flush()
 
     def save(self) -> None:
         payload = {
@@ -142,9 +149,21 @@ class SessionLog:
             "started_at": self.started_at.isoformat(timespec="seconds"),
             "updated_at": datetime.now().isoformat(timespec="seconds"),
             "run_summary": self.run_summary,
-            "records": self.records,
+            "record_count": self.record_count,
+            "records_path": str(self.path),
         }
-        self.path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        self.meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    def flush(self) -> None:
+        self._stream.flush()
+        self._dirty_count = 0
+        self.save()
+
+    def close(self) -> None:
+        try:
+            self.flush()
+        finally:
+            self._stream.close()
 
 
 def read_error_case(path: Path) -> dict[str, Any]:

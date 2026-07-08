@@ -10,6 +10,17 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
 
+try:
+    import requests
+    from requests.exceptions import HTTPError as RequestsHTTPError
+    from requests.exceptions import RequestException as RequestsRequestException
+    from requests.exceptions import Timeout as RequestsTimeout
+except ImportError:  # pragma: no cover - urllib fallback keeps bootstrap usable before pip install.
+    requests = None
+    RequestsHTTPError = None
+    RequestsRequestException = None
+    RequestsTimeout = None
+
 
 from .models import MediaItem, parse_tvcf_date
 from .text_utils import decode_output, subprocess_env
@@ -17,6 +28,10 @@ from .text_utils import decode_output, subprocess_env
 
 LogCallback = Optional[Callable[[str], None]]
 StopCallback = Optional[Callable[[], bool]]
+NETWORK_EXCEPTIONS = (HTTPError, IncompleteRead, TimeoutError, URLError, OSError) + (
+    (RequestsRequestException,) if RequestsRequestException else ()
+)
+LIST_PAGE_ROWS = 200
 
 
 class TVCFError(RuntimeError):
@@ -34,7 +49,7 @@ class TVCFClient:
     _record_re = re.compile(r'\{\\"idx\\":\\"(?P<idx>\d+)\\".*?\\"_score\\":(?:null|\[[^\]]*\])\}', re.S)
     _m3u8_re = re.compile(r"https?://[^\"\\]+?\.m3u8(?:\?[^\"\\]*)?")
 
-    def __init__(self, timeout: int = 25, delay: float = 0.3) -> None:
+    def __init__(self, timeout: int = 25, delay: float = 0.0) -> None:
         self.timeout = timeout
         self.delay = delay
         self.playwright_attempted_urls: set[str] = set()
@@ -44,12 +59,17 @@ class TVCFClient:
             "User-Agent": self.USER_AGENT,
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.6,en;q=0.5",
         }
+        self._session = requests.Session() if requests else None
+        if self._session:
+            self._session.headers.update(self.headers)
 
     def close(self) -> None:
         browser = self._browser
         playwright = self._playwright
+        session = self._session
         self._browser = None
         self._playwright = None
+        self._session = None
         if browser:
             try:
                 browser.close()
@@ -60,6 +80,8 @@ class TVCFClient:
                 playwright.stop()
             except Exception:
                 pass
+        if session:
+            session.close()
 
     def __enter__(self) -> "TVCFClient":
         return self
@@ -70,7 +92,7 @@ class TVCFClient:
     def list_page(
         self,
         page: int,
-        rows: int = 50,
+        rows: int = LIST_PAGE_ROWS,
         sort_by: str = "registrated_date",
         log: LogCallback = None,
     ) -> List[MediaItem]:
@@ -147,7 +169,8 @@ class TVCFClient:
                     )
                 break
 
-            time.sleep(self.delay)
+            if self.delay > 0:
+                time.sleep(self.delay)
             page += 1
 
         if not items and log:
@@ -446,7 +469,7 @@ class TVCFClient:
         return self._browser
 
     def _get_text(self, url: str, params: Optional[dict] = None, log: LogCallback = None) -> str:
-        if params:
+        if params and not self._session:
             separator = "&" if "?" in url else "?"
             url = f"{url}{separator}{urlencode(params)}"
 
@@ -454,22 +477,11 @@ class TVCFClient:
         attempt = 1
         max_attempts = 3
         while attempt <= max_attempts:
-            request = Request(url, headers=self.headers)
             try:
-                with urlopen(request, timeout=self.timeout) as response:
-                    try:
-                        raw = response.read()
-                    except IncompleteRead as exc:
-                        raw = exc.partial
-                        if not raw or len(raw) < 2048:
-                            raise
-                    content_type = response.headers.get("Content-Type", "")
-                    encoding = "utf-8"
-                    match = re.search(r"charset=([\w-]+)", content_type, re.I)
-                    if match:
-                        encoding = match.group(1)
-                    return decode_output(raw, preferred=encoding)
-            except (HTTPError, IncompleteRead, TimeoutError, URLError, OSError) as exc:
+                if self._session:
+                    return self._get_text_with_session(url, params=params)
+                return self._get_text_with_urllib(url)
+            except NETWORK_EXCEPTIONS as exc:
                 last_error = exc
                 max_attempts, wait_seconds, reason = self._retry_policy(exc)
                 if attempt < max_attempts:
@@ -485,25 +497,63 @@ class TVCFClient:
             ) from last_error
         raise TVCFError(f"페이지를 읽지 못했습니다: {url}")
 
+    def _get_text_with_session(self, url: str, params: Optional[dict] = None) -> str:
+        if not self._session:
+            raise TVCFError("HTTP 세션이 초기화되지 않았습니다.")
+        response = self._session.get(url, params=params, timeout=self.timeout)
+        response.raise_for_status()
+        if not response.encoding:
+            response.encoding = "utf-8"
+        return response.text
+
+    def _get_text_with_urllib(self, url: str) -> str:
+        request = Request(url, headers=self.headers)
+        with urlopen(request, timeout=self.timeout) as response:
+            try:
+                raw = response.read()
+            except IncompleteRead as exc:
+                raw = exc.partial
+                if not raw or len(raw) < 2048:
+                    raise
+            content_type = response.headers.get("Content-Type", "")
+            encoding = "utf-8"
+            match = re.search(r"charset=([\w-]+)", content_type, re.I)
+            if match:
+                encoding = match.group(1)
+            return decode_output(raw, preferred=encoding)
+
     @staticmethod
     def _retry_policy(exc: Exception) -> tuple[int, float, str]:
+        if RequestsHTTPError and isinstance(exc, RequestsHTTPError):
+            response = getattr(exc, "response", None)
+            code = getattr(response, "status_code", None)
+            if code:
+                return TVCFClient._http_retry_policy(int(code))
         if isinstance(exc, HTTPError):
-            if exc.code == 404:
-                return 1, 0.0, "HTTP 404"
-            if exc.code == 403:
-                return 2, 1.0, "HTTP 403"
-            if exc.code == 429:
-                return 3, 3.0, "HTTP 429"
-            if 500 <= exc.code <= 599:
-                return 3, 1.2, f"HTTP {exc.code}"
-            return 2, 1.0, f"HTTP {exc.code}"
+            return TVCFClient._http_retry_policy(exc.code)
+        if RequestsTimeout and isinstance(exc, RequestsTimeout):
+            return 3, 1.0, "timeout"
         if isinstance(exc, TimeoutError):
             return 3, 1.0, "timeout"
         if isinstance(exc, IncompleteRead):
             return 3, 1.0, "네트워크 오류"
+        if RequestsRequestException and isinstance(exc, RequestsRequestException):
+            return 3, 1.0, "네트워크 오류"
         if isinstance(exc, (URLError, OSError)):
             return 3, 1.0, "네트워크 오류"
         return 1, 0.0, "알 수 없는 오류"
+
+    @staticmethod
+    def _http_retry_policy(code: int) -> tuple[int, float, str]:
+        if code == 404:
+            return 1, 0.0, "HTTP 404"
+        if code == 403:
+            return 2, 1.0, "HTTP 403"
+        if code == 429:
+            return 3, 3.0, "HTTP 429"
+        if 500 <= code <= 599:
+            return 3, 1.2, f"HTTP {code}"
+        return 2, 1.0, f"HTTP {code}"
 
     @classmethod
     def _retry_reason(cls, exc: Exception) -> str:

@@ -124,6 +124,7 @@ class DownloaderApp:
         self.item_by_id: dict[str, MediaItem] = {}
         self.row_records: dict[str, dict] = {}
         self.row_order: list[str] = []
+        self.status_counts: dict[str, int] = {}
         self.checked_rows: set[str] = set()
         self.retry_queue: deque[tuple[str, MediaItem]] = deque()
         self.queued_retry_rows: set[str] = set()
@@ -897,6 +898,7 @@ class DownloaderApp:
         finally:
             if client:
                 client.close()
+            self._close_session_log()
             flush_history()
 
     def _drain_retry_queue(self, client: TVCFClient, options: dict[str, object]) -> int:
@@ -1171,6 +1173,17 @@ class DownloaderApp:
         except OSError:
             pass
 
+    def _close_session_log(self) -> None:
+        if not self.session_log:
+            return
+        try:
+            with self.session_lock:
+                if self.session_log:
+                    self.session_log.close()
+                    self.session_log = None
+        except OSError:
+            self.session_log = None
+
     def download(self) -> None:
         self._start_worker(download=True)
 
@@ -1268,6 +1281,7 @@ class DownloaderApp:
         finally:
             if client:
                 client.close()
+            self._close_session_log()
             flush_history()
 
     def _download_items_pipeline(
@@ -1624,6 +1638,7 @@ class DownloaderApp:
         self.item_by_id = {}
         self.row_records = {}
         self.row_order = []
+        self.status_counts = {}
         for row_index, item in enumerate(items):
             item_id = item.nidx or item.idx or item.mcode
             if not item_id:
@@ -1639,6 +1654,7 @@ class DownloaderApp:
                 "saved_path": "",
                 "row_index": row_index,
             }
+            self._add_status_count("대기", 1)
         self._render_tree()
 
     def _render_tree(self) -> None:
@@ -1702,7 +1718,9 @@ class DownloaderApp:
             return
         record = self.row_records.get(item_id)
         if record:
+            old_status = str(record.get("status", ""))
             record["status"] = status
+            self._change_status_count(old_status, status)
         if self._filters_active():
             self._render_tree()
             return
@@ -1713,6 +1731,21 @@ class DownloaderApp:
                 self.tree.item(item_id, values=values, tags=self._row_tags(status, self.tree.index(item_id)))
         self._update_summary_stats()
 
+    def _change_status_count(self, old_status: str, new_status: str) -> None:
+        if old_status == new_status:
+            return
+        self._add_status_count(old_status, -1)
+        self._add_status_count(new_status, 1)
+
+    def _add_status_count(self, status: str, amount: int) -> None:
+        if not status or amount == 0:
+            return
+        count = self.status_counts.get(status, 0) + amount
+        if count <= 0:
+            self.status_counts.pop(status, None)
+        else:
+            self.status_counts[status] = count
+
     def _refresh_row_stripes(self) -> None:
         self._render_tree()
 
@@ -1721,6 +1754,7 @@ class DownloaderApp:
         self.item_by_id = {}
         self.row_records = {}
         self.row_order = []
+        self.status_counts = {}
         self.checked_rows.clear()
         self.error_case_by_id.clear()
         with self.retry_lock:
@@ -1875,12 +1909,14 @@ class DownloaderApp:
             messagebox.showerror("저장 폴더 열기", f"저장 폴더를 열 수 없습니다.\n{exc}")
 
     def _update_summary_stats(self) -> None:
-        statuses = [str(record.get("status", "")) for record in self.row_records.values()]
-        done = sum(1 for status in statuses if status in DONE_STATUSES)
-        errors = sum(1 for status in statuses if status in ERROR_STATUSES)
-        skipped = sum(1 for status in statuses if status == "건너뜀")
-        total = len(statuses)
-        processed = done + errors + skipped + sum(1 for status in statuses if status in {"한국 아님", "광고 아님"})
+        done = sum(self.status_counts.get(status, 0) for status in DONE_STATUSES)
+        errors = sum(self.status_counts.get(status, 0) for status in ERROR_STATUSES)
+        skipped = self.status_counts.get("건너뜀", 0)
+        total = len(self.row_records)
+        processed = done + errors + skipped + sum(
+            self.status_counts.get(status, 0)
+            for status in ("한국 아님", "광고 아님")
+        )
         self.summary_stats_var.set(
             f"완료 {done} / 오류 {errors} / 건너뜀 {skipped} / Playwright {self.playwright_fallback_count}회"
         )
@@ -1943,10 +1979,9 @@ class DownloaderApp:
             self._schedule_shutdown()
 
     def _completion_counts(self) -> tuple[int, int, int]:
-        statuses = [str(record.get("status", "")) for record in self.row_records.values()]
-        done = sum(1 for value in statuses if value in DONE_STATUSES)
-        errors = sum(1 for value in statuses if value in ERROR_STATUSES)
-        skipped = sum(1 for value in statuses if value == "건너뜀")
+        done = sum(self.status_counts.get(status, 0) for status in DONE_STATUSES)
+        errors = sum(self.status_counts.get(status, 0) for status in ERROR_STATUSES)
+        skipped = self.status_counts.get("건너뜀", 0)
         return done, errors, skipped
 
     def _open_download_dir_from_completion(self) -> None:
