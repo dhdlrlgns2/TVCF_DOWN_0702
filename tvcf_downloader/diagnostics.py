@@ -110,10 +110,11 @@ class SessionLog:
     def __init__(self, run_summary: str) -> None:
         SESSION_DIR.mkdir(parents=True, exist_ok=True)
         self.started_at = datetime.now()
-        self.session_id = self.started_at.strftime("%Y%m%d_%H%M%S")
+        self.session_id = self.started_at.strftime("%Y%m%d_%H%M%S_%f")
         self.run_summary = run_summary
         self.record_count = 0
         self._dirty_count = 0
+        self._closed = False
         self.path = SESSION_DIR / f"{self.session_id}.jsonl"
         self.meta_path = SESSION_DIR / f"{self.session_id}.json"
         self._stream = self.path.open("a", encoding="utf-8")
@@ -128,6 +129,8 @@ class SessionLog:
         output_path: str = "",
         error_path: str = "",
     ) -> None:
+        if self._closed:
+            return
         record = {
             "time": datetime.now().isoformat(timespec="seconds"),
             "status": status,
@@ -155,15 +158,20 @@ class SessionLog:
         self.meta_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
     def flush(self) -> None:
+        if self._closed:
+            return
         self._stream.flush()
         self._dirty_count = 0
         self.save()
 
     def close(self) -> None:
+        if self._closed:
+            return
         try:
             self.flush()
         finally:
             self._stream.close()
+            self._closed = True
 
 
 def read_error_case(path: Path) -> dict[str, Any]:

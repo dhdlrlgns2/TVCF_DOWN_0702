@@ -15,6 +15,7 @@ from .client import TVCFClient, TVCFError
 from .config import PROJECT_ROOT, load_config, save_config
 from .diagnostics import SessionLog, classify_error, save_error_case
 from .downloader import DownloadCancelled, download_media, prepare_download_tools
+from .gui_worker import DownloadWorkerMixin
 from .history import flush_history
 from .issue_reporter import report_error_cases
 from .models import MediaItem
@@ -107,7 +108,7 @@ MAX_LOG_MESSAGE_CHARS = 1200
 MEDIA_CACHE_TTL_SECONDS = 1800
 
 
-class DownloaderApp:
+class DownloaderApp(DownloadWorkerMixin):
     def __init__(self, root: Tk) -> None:
         self.root = root
         self.root.title("TVCF 한국 광고 다운로더")
@@ -145,6 +146,7 @@ class DownloaderApp:
         self.last_ffmpeg_size_at = 0.0
         self.log_line_count = 0
         self.last_checkpoint_save_at = 0.0
+        self.tree_render_pending = False
 
         today = datetime.now().date()
         default_from = today - timedelta(days=30)
@@ -776,13 +778,17 @@ class DownloaderApp:
                 self.queued_retry_rows.add(row_id)
                 added += 1
 
+        should_render = False
         for row_id in row_ids:
-            self._set_row_checked(row_id, False)
+            self._set_row_checked(row_id, False, render=False)
+            should_render = True
             if row_id in self.queued_retry_rows:
                 if row_id in self.row_order:
                     self.row_order.remove(row_id)
                     self.row_order.append(row_id)
                 self._set_item_status(row_id, "대기열에 다시 추가됨")
+        if should_render:
+            self._render_tree()
 
         if added <= 0:
             self._log("이미 재다운로드 대기열에 있는 항목입니다.")
@@ -792,8 +798,14 @@ class DownloaderApp:
             self._log(f"재다운로드 대기열에 {added}개 항목을 추가했습니다.")
             self._extend_progress_total(added)
             self._set_status("재다운로드 대기열 추가됨")
+            if not (self.worker and self.worker.is_alive()):
+                self._log("기존 작업이 끝나 별도 재다운로드 작업으로 이어서 실행합니다.")
+                self._start_retry_queue_worker(added)
             return
 
+        self._start_retry_queue_worker(added)
+
+    def _start_retry_queue_worker(self, added: int) -> None:
         self.stop_event.clear()
         self._save_current_config()
         self.run_summary = f"재다운로드 대기열 / {added}개"
@@ -851,14 +863,15 @@ class DownloaderApp:
         values = list(self.tree.item(row_id, "values"))
         return str(values[4]) if len(values) >= 5 else ""
 
-    def _set_row_checked(self, row_id: str, checked: bool) -> None:
+    def _set_row_checked(self, row_id: str, checked: bool, render: bool = True) -> None:
         if row_id not in self.row_records:
             return
         if checked:
             self.checked_rows.add(row_id)
         else:
             self.checked_rows.discard(row_id)
-        self._render_tree()
+        if render:
+            self._render_tree()
 
     def _extend_progress_total(self, amount: int) -> None:
         if not hasattr(self, "progress") or amount <= 0:
@@ -901,13 +914,23 @@ class DownloaderApp:
             self._close_session_log()
             flush_history()
 
-    def _drain_retry_queue(self, client: TVCFClient, options: dict[str, object]) -> int:
+    def _drain_retry_queue(self, client: TVCFClient, options: dict[str, object], wait_for_new: bool = False) -> int:
         failed_count = 0
+        idle_deadline = time.monotonic() + 0.8
         while True:
             with self.retry_lock:
-                if not self.retry_queue:
+                if self.retry_queue:
+                    row_id, item = self.retry_queue.popleft()
+                    idle_deadline = time.monotonic() + 0.8
+                else:
+                    row_id = ""
+                    item = None
+
+            if item is None:
+                if not wait_for_new or time.monotonic() >= idle_deadline:
                     break
-                row_id, item = self.retry_queue.popleft()
+                time.sleep(0.05)
+                continue
 
             if self.stop_event.is_set():
                 raise DownloadCancelled("사용자 중단 요청으로 재다운로드 대기열을 중단했습니다.")
@@ -1233,337 +1256,6 @@ class DownloaderApp:
             "fast_verify": True,
         }
 
-    def _worker_run(self, download: bool, options: dict[str, object]) -> None:
-        client: TVCFClient | None = None
-        try:
-            client = TVCFClient()
-            items = self._build_items(client, options)
-            self.events.put(("items", items))
-            self._checkpoint(f"대상 수집 완료: {self.run_summary} / 대상 {len(items)}개")
-
-            if not download:
-                self.events.put(("status", f"대상 확인 완료: {len(items)}개"))
-                return
-
-            if not items:
-                self.events.put(("status", "대상 없음"))
-                self.events.put(("log", "다운로드할 한국 광고가 없습니다. 날짜 기준과 시작일을 확인해주세요."))
-                return
-
-            self.events.put(("progress_max", max(1, len(items))))
-            failed_count = 0
-            parallel_count = self._normalize_parallel(options.get("parallel"))
-            self.events.put(("log", "다운로드 도구 확인 중"))
-            tools = prepare_download_tools(
-                prefer_ytdlp=bool(options.get("prefer_ytdlp", True)),
-                log=lambda msg: self.events.put(("log", msg)),
-            )
-            options = {**options, "tools": tools}
-            failed_count += self._download_items_pipeline(client, items, parallel_count, options)
-            if self.stop_event.is_set():
-                self.events.put(("status", "중단됨"))
-                self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
-                return
-
-            retry_failed_count = self._drain_retry_queue(client, options)
-            failed_count += retry_failed_count
-
-            if failed_count:
-                self.events.put(("status", f"다운로드 완료(오류 {failed_count}개)"))
-            else:
-                self.events.put(("status", "다운로드 완료"))
-            self._checkpoint(f"작업 완료: {self.run_summary}")
-        except Exception as exc:  # noqa: BLE001 - show GUI error.
-            self._save_error_case("", None, "전체 작업", exc, options)
-            self.events.put(("status", "오류"))
-            self.events.put(("log", f"오류: {exc}"))
-            self.events.put(("log", f"마지막 작업: {self.last_checkpoint}"))
-        finally:
-            if client:
-                client.close()
-            self._close_session_log()
-            flush_history()
-
-    def _download_items_pipeline(
-        self,
-        client: TVCFClient,
-        items: list[MediaItem],
-        parallel_count: int,
-        options: dict[str, object],
-    ) -> int:
-        if parallel_count <= 1:
-            return self._download_items_sequential_prefetch(client, items, options)
-        return self._download_items_parallel_prefetch(items, parallel_count, options)
-
-    def _download_items_sequential_prefetch(
-        self,
-        client: TVCFClient,
-        items: list[MediaItem],
-        options: dict[str, object],
-    ) -> int:
-        self.events.put(("log", "상세 확인 프리패치를 사용합니다."))
-        sentinel = object()
-        ready_queue: queue.Queue[object] = queue.Queue()
-
-        def prefetch_loop() -> None:
-            prefetch_client = TVCFClient()
-            try:
-                for index, item in enumerate(items, start=1):
-                    if self.stop_event.is_set():
-                        break
-                    try:
-                        detail = self._prefetch_item_detail(prefetch_client, index, len(items), item, options)
-                        ready_queue.put((index, item, detail, None))
-                    except DownloadCancelled:
-                        self.stop_event.set()
-                        break
-                    except Exception as exc:  # noqa: BLE001 - hand detail errors to the normal item handler.
-                        ready_queue.put((index, item, None, exc))
-            finally:
-                prefetch_client.close()
-                ready_queue.put(sentinel)
-
-        prefetch_thread = threading.Thread(target=prefetch_loop, daemon=True)
-        prefetch_thread.start()
-
-        failed_count = 0
-        completed = 0
-        try:
-            while True:
-                job = ready_queue.get()
-                if job is sentinel:
-                    break
-                index, item, detail, detail_error = job
-                if self.stop_event.is_set():
-                    break
-                failed_count += int(
-                    self._download_one_item(
-                        client,
-                        index,
-                        len(items),
-                        item,
-                        options,
-                        prepared_detail=detail,
-                        detail_error=detail_error,
-                    )
-                )
-                completed += 1
-                self.events.put(("progress", completed))
-        finally:
-            prefetch_thread.join()
-
-        return failed_count
-
-    def _download_items_parallel_prefetch(self, items: list[MediaItem], parallel_count: int, options: dict[str, object]) -> int:
-        prefetch_count = min(max(2, parallel_count), 6, len(items))
-        self.events.put(("log", f"병렬 다운로드 {parallel_count}개 / 상세 프리패치 {prefetch_count}개로 실행합니다."))
-        failed_count = 0
-        completed = 0
-        item_queue: queue.Queue[object] = queue.Queue()
-        ready_queue: queue.Queue[object] = queue.Queue()
-        result_lock = threading.Lock()
-        sentinel = object()
-
-        for index, item in enumerate(items, start=1):
-            item_queue.put((index, item))
-        for _ in range(prefetch_count):
-            item_queue.put(sentinel)
-
-        def prefetch_loop() -> None:
-            prefetch_client = TVCFClient()
-            try:
-                while not self.stop_event.is_set():
-                    task = item_queue.get()
-                    if task is sentinel:
-                        return
-                    index, item = task
-                    try:
-                        detail = self._prefetch_item_detail(prefetch_client, index, len(items), item, options)
-                        ready_queue.put((index, item, detail, None))
-                    except DownloadCancelled:
-                        self.stop_event.set()
-                        return
-                    except Exception as exc:  # noqa: BLE001 - hand detail errors to the normal item handler.
-                        ready_queue.put((index, item, None, exc))
-            finally:
-                prefetch_client.close()
-
-        def download_loop() -> None:
-            nonlocal completed, failed_count
-            download_client = TVCFClient()
-            try:
-                while True:
-                    job = ready_queue.get()
-                    if job is sentinel:
-                        return
-                    item_index, item, detail, detail_error = job
-                    if self.stop_event.is_set():
-                        return
-                    try:
-                        failed = self._download_one_item(
-                            download_client,
-                            item_index,
-                            len(items),
-                            item,
-                            options,
-                            prepared_detail=detail,
-                            detail_error=detail_error,
-                        )
-                    except DownloadCancelled:
-                        self.stop_event.set()
-                        self.events.put(("status", "중단됨"))
-                        self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
-                        return
-                    except Exception as exc:  # noqa: BLE001 - keep other workers from disappearing silently.
-                        row_id = item.nidx or item.idx or item.mcode
-                        category = self._save_error_case(row_id, item, "병렬 작업", exc, options)
-                        self.events.put(("item_status", row_id, category))
-                        self.events.put(("log", f"병렬 작업 오류 - 건너뜀: {item.display_title} / {exc}"))
-                        failed = True
-                    with result_lock:
-                        failed_count += int(failed)
-                        completed += 1
-                        self.events.put(("progress", completed))
-            finally:
-                download_client.close()
-
-        prefetch_workers = [threading.Thread(target=prefetch_loop, daemon=True) for _ in range(prefetch_count)]
-        download_workers = [
-            threading.Thread(target=download_loop, daemon=True)
-            for _ in range(min(parallel_count, len(items)))
-        ]
-
-        for worker in prefetch_workers + download_workers:
-            worker.start()
-        for worker in prefetch_workers:
-            worker.join()
-        for _ in download_workers:
-            ready_queue.put(sentinel)
-        for worker in download_workers:
-            worker.join()
-
-        return failed_count
-
-    def _prefetch_item_detail(
-        self,
-        client: TVCFClient,
-        index: int,
-        total: int,
-        item: MediaItem,
-        options: dict[str, object],
-    ) -> MediaItem:
-        row_id = item.nidx or item.idx or item.mcode
-        label = item.display_title
-        date_basis = str(options.get("date_basis", "published"))
-        position = self._item_position_text(index, total, item, date_basis)
-        self._checkpoint(f"{self.run_summary} / {position} 상세 확인 중 / {label}")
-        self.events.put(("item_status", row_id, "상세 확인"))
-        self.events.put(("log", f"[{index}/{total}] {label}"))
-        return self._get_media_detail(
-            client,
-            item,
-            use_playwright=bool(options.get("use_playwright_fallback", True)),
-        )
-
-    def _download_one_item(
-        self,
-        client: TVCFClient,
-        index: int,
-        total: int,
-        item: MediaItem,
-        options: dict[str, object],
-        prepared_detail: MediaItem | None = None,
-        detail_error: BaseException | None = None,
-    ) -> bool:
-        row_id = item.nidx or item.idx or item.mcode
-        if self.stop_event.is_set():
-            raise DownloadCancelled("사용자 중단 요청")
-
-        label = item.display_title
-        date_basis = str(options.get("date_basis", "published"))
-        position = self._item_position_text(index, total, item, date_basis)
-
-        try:
-            if detail_error:
-                raise detail_error
-            detail = prepared_detail or self._prefetch_item_detail(client, index, total, item, options)
-        except Exception as exc:  # noqa: BLE001 - keep batch moving after one bad page.
-            category = self._save_error_case(row_id, item, "상세 확인", exc, options)
-            self.events.put(("item_status", row_id, category))
-            self.events.put(("log", f"상세 확인 오류 - 건너뜀: {label} / {exc}"))
-            return True
-
-        if detail.country_code and detail.country_code != "410":
-            self._record_session("한국 아님", "상세 확인", detail, "한국 광고가 아니어서 제외")
-            self.events.put(("item_status", row_id, "한국 아님"))
-            return False
-        if detail.category_code and detail.category_code != "1":
-            self._record_session("광고 아님", "상세 확인", detail, "광고 카테고리가 아니어서 제외")
-            self.events.put(("item_status", row_id, "광고 아님"))
-            return False
-
-        merged = self._merge_item(item, detail)
-        self._checkpoint(f"{self.run_summary} / {position} 다운로드 중 / {merged.display_title}")
-        self.events.put(("item_status", row_id, "다운로드"))
-        try:
-            output = download_media(
-                merged,
-                str(options.get("download_dir", "")),
-                str(options.get("quality", "가능한 최고화질")),
-                str(options.get("date_basis", "published")),
-                prefer_ytdlp=bool(options.get("prefer_ytdlp", True)),
-                log=lambda msg: self.events.put(("log", msg)),
-                should_stop=self.stop_event.is_set,
-                tools=options.get("tools"),
-                fast_verify=bool(options.get("fast_verify", True)),
-            )
-        except DownloadCancelled:
-            self._record_session("중단됨", "다운로드", merged, "사용자 중단")
-            self.events.put(("item_status", row_id, "중단됨"))
-            raise
-        except Exception as exc:  # noqa: BLE001 - skip failed item and continue.
-            category = self._save_error_case(row_id, merged, "다운로드", exc, options)
-            self.events.put(("item_status", row_id, category))
-            self.events.put(("log", f"다운로드 오류 - 건너뜀: {merged.display_title} / {exc}"))
-            return True
-
-        result_status = "건너뜀" if output.skipped else "재다운완료" if output.repaired else "완료"
-        self._record_session(result_status, "다운로드", merged, output_path=str(output.path))
-        self.events.put(("output_path", row_id, str(output.path)))
-        self.events.put(("item_status", row_id, result_status))
-        self.events.put(("log", f"저장 완료: {output.path}"))
-        return False
-
-    def _build_items(self, client: TVCFClient, options: dict[str, object]) -> list[MediaItem]:
-        start = datetime.strptime(str(options.get("date_from", "")).strip(), "%Y-%m-%d").date()
-        end = datetime.strptime(str(options.get("date_to", "")).strip(), "%Y-%m-%d").date()
-        if start > end:
-            start, end = end, start
-        date_basis = str(options.get("date_basis", "published"))
-        items = client.collect_period(
-            start,
-            end,
-            date_basis,
-            0,
-            log=lambda msg: self.events.put(("log", msg)),
-            should_stop=self.stop_event.is_set,
-        )
-        return self._sort_items_by_file_date(items, date_basis)
-
-    def _sort_items_by_file_date(self, items: list[MediaItem], basis: str) -> list[MediaItem]:
-        indexed_items = list(enumerate(items))
-        return [
-            item
-            for _, item in sorted(
-                indexed_items,
-                key=lambda pair: (
-                    pair[1].date_value(basis) is None,
-                    pair[1].date_value(basis),
-                    pair[0],
-                ),
-            )
-        ]
-
     @staticmethod
     def _merge_item(base: MediaItem, detail: MediaItem) -> MediaItem:
         return MediaItem(
@@ -1660,6 +1352,7 @@ class DownloaderApp:
     def _render_tree(self) -> None:
         if not hasattr(self, "tree"):
             return
+        self.tree_render_pending = False
         self._clear_tree()
         visible_index = 0
         for row_id in self.row_order:
@@ -1682,6 +1375,12 @@ class DownloaderApp:
             )
             visible_index += 1
         self._update_summary_stats()
+
+    def _schedule_tree_render(self) -> None:
+        if self.tree_render_pending:
+            return
+        self.tree_render_pending = True
+        self.root.after(120, self._render_tree)
 
     def _filters_active(self) -> bool:
         return self.status_filter_var.get() != "전체" or bool(self.search_var.get().strip())
@@ -1722,7 +1421,8 @@ class DownloaderApp:
             record["status"] = status
             self._change_status_count(old_status, status)
         if self._filters_active():
-            self._render_tree()
+            self._update_summary_stats()
+            self._schedule_tree_render()
             return
         if self.tree.exists(item_id):
             values = list(self.tree.item(item_id, "values"))
@@ -1892,7 +1592,7 @@ class DownloaderApp:
         if record:
             record["saved_path"] = path
         if self._filters_active():
-            self._render_tree()
+            self._schedule_tree_render()
 
     def _clear_search(self) -> None:
         self.search_var.set("")
