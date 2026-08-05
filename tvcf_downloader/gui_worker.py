@@ -8,6 +8,7 @@ from .client import TVCFClient
 from .downloader import DownloadCancelled, download_media, prepare_download_tools
 from .history import flush_history
 from .models import MediaItem
+from .youtube_search import find_youtube_media
 
 
 class DownloadWorkerMixin:
@@ -28,16 +29,20 @@ class DownloadWorkerMixin:
                 self.events.put(("log", "다운로드할 한국 광고가 없습니다. 날짜 기준과 시작일을 확인해주세요."))
                 return
 
+            client.close()
+            self.events.put(("log", "TVCF 제목 수집 완료: Chrome 목록 창을 닫고 YouTube 검색을 시작합니다."))
             self.events.put(("progress_max", max(1, len(items))))
-            failed_count = 0
             parallel_count = self._normalize_parallel(options.get("parallel"))
-            self.events.put(("log", "다운로드 도구 확인 중"))
+            self.events.put(("log", "YouTube 검색 및 다운로드 도구 확인 중"))
             tools = prepare_download_tools(
-                prefer_ytdlp=bool(options.get("prefer_ytdlp", True)),
+                prefer_ytdlp=True,
                 log=lambda msg: self.events.put(("log", msg)),
             )
-            options = {**options, "tools": tools}
-            failed_count += self._download_items_pipeline(client, items, parallel_count, options)
+            options = {**options, "tools": tools, "prefer_ytdlp": True}
+            self.events.put(
+                ("log", f"TVCF 제목으로 YouTube 원본을 검색하고 병렬 {parallel_count}개로 다운로드합니다.")
+            )
+            failed_count = self._download_items_pipeline(client, items, parallel_count, options)
             if self.stop_event.is_set():
                 self.events.put(("status", "중단됨"))
                 self.events.put(("log", f"중단 지점: {self.last_checkpoint}"))
@@ -79,7 +84,7 @@ class DownloadWorkerMixin:
         items: list[MediaItem],
         options: dict[str, object],
     ) -> int:
-        self.events.put(("log", "상세 확인 프리패치를 사용합니다."))
+        self.events.put(("log", "YouTube 검색 프리패치를 사용합니다."))
         sentinel = object()
         ready_queue: queue.Queue[object] = queue.Queue()
 
@@ -234,13 +239,15 @@ class DownloadWorkerMixin:
         label = item.display_title
         date_basis = str(options.get("date_basis", "published"))
         position = self._item_position_text(index, total, item, date_basis)
-        self._checkpoint(f"{self.run_summary} / {position} 상세 확인 중 / {label}")
-        self.events.put(("item_status", row_id, "상세 확인"))
+        self._checkpoint(f"{self.run_summary} / {position} YouTube 검색 중 / {label}")
+        self.events.put(("item_status", row_id, "YouTube 검색"))
         self.events.put(("log", f"[{index}/{total}] {label}"))
-        return self._get_media_detail(
-            client,
+        tools = options.get("tools")
+        return find_youtube_media(
             item,
-            use_playwright=bool(options.get("use_playwright_fallback", True)),
+            ytdlp_cmd=getattr(tools, "ytdlp_cmd", None),
+            log=lambda msg: self.events.put(("log", msg)),
+            should_stop=self.stop_event.is_set,
         )
 
     def _download_one_item(
@@ -266,17 +273,17 @@ class DownloadWorkerMixin:
                 raise detail_error
             detail = prepared_detail or self._prefetch_item_detail(client, index, total, item, options)
         except Exception as exc:  # noqa: BLE001 - keep batch moving after one bad page.
-            category = self._save_error_case(row_id, item, "상세 확인", exc, options)
+            category = self._save_error_case(row_id, item, "YouTube 검색", exc, options)
             self.events.put(("item_status", row_id, category))
-            self.events.put(("log", f"상세 확인 오류 - 건너뜀: {label} / {exc}"))
+            self.events.put(("log", f"YouTube 일치 영상 없음 - 건너뜀: {label} / {exc}"))
             return True
 
         if detail.country_code and detail.country_code != "410":
-            self._record_session("한국 아님", "상세 확인", detail, "한국 광고가 아니어서 제외")
+            self._record_session("한국 아님", "YouTube 검색", detail, "한국 광고가 아니어서 제외")
             self.events.put(("item_status", row_id, "한국 아님"))
             return False
         if detail.category_code and detail.category_code != "1":
-            self._record_session("광고 아님", "상세 확인", detail, "광고 카테고리가 아니어서 제외")
+            self._record_session("광고 아님", "YouTube 검색", detail, "광고 카테고리가 아니어서 제외")
             self.events.put(("item_status", row_id, "광고 아님"))
             return False
 

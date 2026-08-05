@@ -163,6 +163,7 @@ def verify_downloaded_file(path: Path, ffprobe: str, quick: bool = False) -> Non
 def cleanup_stale_download_files(output_path: Path) -> None:
     stale_paths = {
         output_path.with_name(f"{output_path.stem}.part{output_path.suffix}"),
+        output_path.with_name(f"{output_path.stem}.browser.part{output_path.suffix}"),
         output_path.with_suffix(output_path.suffix + ".part"),
     }
     for pattern in (
@@ -396,13 +397,6 @@ def _download_with_ytdlp(
         "--no-warnings",
         "--no-playlist",
         "--force-overwrites",
-        "--referer",
-        item.play_url or item.source_page or "https://tvcf.co.kr/",
-        "--user-agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-        "--add-header",
-        "Origin:https://tvcf.co.kr",
         "--ffmpeg-location",
         str(Path(ffmpeg).parent),
         "--merge-output-format",
@@ -411,8 +405,17 @@ def _download_with_ytdlp(
         str(YTDLP_CONCURRENT_FRAGMENTS),
         "-o",
         str(output_path),
-        stream_url,
     ]
+    if not is_youtube_url(stream_url):
+        cmd.extend(
+            [
+                "--referer",
+                item.play_url or item.source_page or "https://tvcf.co.kr/",
+                "--add-header",
+                "Origin:https://tvcf.co.kr",
+            ]
+        )
+    cmd.append(stream_url)
     _run_command(cmd, log, should_stop)
 
 
@@ -442,9 +445,6 @@ def _download_with_ffmpeg(
         "error",
         "-stats",
         "-y",
-        "-user_agent",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
         "-headers",
         headers,
         "-reconnect",

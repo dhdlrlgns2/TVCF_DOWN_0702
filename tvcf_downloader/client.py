@@ -1,11 +1,10 @@
 import json
 import re
-import subprocess
 import time
 from datetime import date
 from http.client import IncompleteRead
 from html import unescape
-from typing import Any, Callable, Dict, Iterable, List, Optional
+from typing import Any, Callable, Iterable, List, Optional
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
@@ -22,8 +21,9 @@ except ImportError:  # pragma: no cover - urllib fallback keeps bootstrap usable
     RequestsTimeout = None
 
 
+from .browser_session import BrowserSession
 from .models import MediaItem, parse_tvcf_date
-from .text_utils import decode_output, subprocess_env
+from .text_utils import decode_output
 
 
 LogCallback = Optional[Callable[[str], None]]
@@ -40,15 +40,8 @@ class TVCFError(RuntimeError):
 
 class TVCFClient:
     BASE_URL = "https://tvcf.co.kr"
-    USER_AGENT = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/126.0.0.0 Safari/537.36"
-    )
 
     _record_re = re.compile(r'\{\\"idx\\":\\"(?P<idx>\d+)\\".*?\\"_score\\":(?:null|\[[^\]]*\])\}', re.S)
-    _m3u8_re = re.compile(r"https?://[^\"\\]+?\.m3u8(?:\?[^\"\\]*)?")
-
     _automation_block_markers = (
         "자동화된 브라우저에서의 접속은 허용되지 않습니다",
         "Automated browser access is not allowed",
@@ -58,11 +51,9 @@ class TVCFClient:
     def __init__(self, timeout: int = 25, delay: float = 0.0) -> None:
         self.timeout = timeout
         self.delay = delay
-        self.playwright_attempted_urls: set[str] = set()
-        self._playwright = None
-        self._browser = None
+        self._browser_session: BrowserSession | None = None
+        self._browser_mode_announced = False
         self.headers = {
-            "User-Agent": self.USER_AGENT,
             "Accept-Language": "ko-KR,ko;q=0.9,en-US;q=0.6,en;q=0.5",
         }
         self._session = requests.Session() if requests else None
@@ -70,24 +61,20 @@ class TVCFClient:
             self._session.headers.update(self.headers)
 
     def close(self) -> None:
-        browser = self._browser
-        playwright = self._playwright
         session = self._session
-        self._browser = None
-        self._playwright = None
+        browser_session = self._browser_session
         self._session = None
-        if browser:
-            try:
-                browser.close()
-            except Exception:
-                pass
-        if playwright:
-            try:
-                playwright.stop()
-            except Exception:
-                pass
+        self._browser_session = None
         if session:
             session.close()
+        if browser_session:
+            browser_session.close()
+
+    @property
+    def browser_session(self) -> BrowserSession:
+        if not self._browser_session:
+            self._browser_session = BrowserSession()
+        return self._browser_session
 
     def __enter__(self) -> "TVCFClient":
         return self
@@ -204,69 +191,10 @@ class TVCFClient:
         use_playwright_fallback: bool = True,
         log: LogCallback = None,
     ) -> MediaItem:
-        errors: List[str] = []
-        for url in self._candidate_urls(identifier):
-            try:
-                html = self._get_text(url, log=log)
-                item = self.parse_play_page(html, url)
-                if item.stream_urls:
-                    return item
-
-                streams = self.sniff_streams_with_ytdlp(url, log=log)
-                if streams:
-                    item.stream_urls = streams
-                    return item
-
-                if use_playwright_fallback:
-                    streams = self.sniff_streams_with_playwright(url, log=log)
-                    if streams:
-                        item.stream_urls = streams
-                        return item
-
-                errors.append(f"{url}: 스트림 없음")
-            except Exception as exc:  # noqa: BLE001 - keep trying candidate URLs.
-                errors.append(f"{url}: {exc}")
-
-        raise TVCFError("; ".join(errors) if errors else "미디어를 찾지 못했습니다.")
-
-    def sniff_streams_with_ytdlp(self, url: str, log: LogCallback = None) -> Dict[str, str]:
-        try:
-            from .downloader import resolve_ytdlp
-
-            cmd = [
-                *resolve_ytdlp(log=None),
-                "--no-warnings",
-                "--no-playlist",
-                "--get-url",
-                url,
-            ]
-            process = subprocess.run(
-                cmd,
-                capture_output=True,
-                env=subprocess_env(),
-                timeout=self.timeout,
-            )
-        except Exception as exc:  # noqa: BLE001 - probing is an optional fallback.
-            if log:
-                log(f"yt-dlp 스트림 해석 실패: {exc}")
-            return {}
-
-        if process.returncode != 0:
-            return {}
-
-        streams: Dict[str, str] = {}
-        for line in decode_output(process.stdout).splitlines():
-            value = line.strip()
-            if not value.startswith("http"):
-                continue
-            key = "youtube" if "youtube.com/" in value or "youtu.be/" in value else "stream"
-            if ".m3u8" in value and "720p" in value:
-                key = "HD"
-            streams.setdefault(key, value)
-
-        if streams and log:
-            log("yt-dlp로 스트림 URL을 해석했습니다.")
-        return streams
+        raise TVCFError(
+            "TVCF 상세 영상 조회는 사용하지 않습니다. "
+            "기간 목록의 제목과 메타데이터를 YouTube 검색 경로에 전달해주세요."
+        )
 
     def parse_list_page(self, html: str) -> List[MediaItem]:
         structured_items = self._items_from_next_flight(html)
@@ -390,91 +318,13 @@ class TVCFClient:
                     return text[start : index + 1]
         return ""
 
-    def parse_play_page(self, html: str, page_url: str) -> MediaItem:
-        flight_text = "".join(self._next_flight_strings(html))
-        initial_obj = self._json_object_after_key(flight_text, "initialData")
-        media_obj = self._json_object_after_key(flight_text, "mediaData")
-        initial = self._slice_after(html, r'\\"initialData\\":{', 40000)
-        media = self._slice_after(html, r'\\"mediaData\\":{', 50000)
-        scope = initial + media
-
-        streams = self._extract_streams_from_objects(initial_obj, media_obj) or self._extract_streams(scope or html)
-        item = MediaItem(
-            idx=self._object_field(initial_obj, "idx") or self._object_field(media_obj, "mIdx") or self._field(initial, "idx") or self._field(media, "mIdx"),
-            nidx=self._object_field(initial_obj, "nidx") or self._slug_from_url(page_url),
-            mcode=self._object_field(initial_obj, "mcode") or self._object_field(media_obj, "mCode") or self._field(initial, "mcode") or self._field(media, "mCode"),
-            title=self._object_field(initial_obj, "title") or self._object_field(media_obj, "title") or self._field(initial, "title") or self._field(media, "title"),
-            chapter=self._object_field(initial_obj, "chapter") or self._object_field(media_obj, "chapter") or self._field(initial, "chapter") or self._field(media, "chapter"),
-            brand=self._object_field(initial_obj, "brand") or self._field(initial, "brand"),
-            published_date=self._object_field(initial_obj, "publishedDate") or self._field(initial, "publishedDate"),
-            registered_date=self._object_field(initial_obj, "registratedDate") or self._field(initial, "registratedDate"),
-            country_code=self._object_field(initial_obj, "countryCode") or self._object_field(initial_obj, "country_code") or self._field(initial, "countryCode") or self._field(initial, "country_code"),
-            category_code=self._object_field(initial_obj, "categoryCode") or self._object_field(initial_obj, "category_code") or self._field(initial, "categoryCode") or self._array_first(initial, "category_code"),
-            category_name=self._object_field(initial_obj, "categoryCodeName") or self._object_field(initial_obj, "category_code_name") or self._field(initial, "categoryCodeName") or self._field(initial, "category_code_name"),
-            play_url=page_url,
-            source_page=page_url,
-            stream_urls=streams,
-        )
-
-        if item.country_code == "410" and not item.category_code and item.category_name == "광고":
-            item.category_code = "1"
-
-        if not item.title:
-            item.title = self._meta_title(html)
-
-        return item
-
-    def sniff_streams_with_playwright(self, url: str, log: LogCallback = None) -> Dict[str, str]:
-        if url in self.playwright_attempted_urls:
-            if log:
-                log("Playwright fallback은 이미 시도한 항목이라 건너뜁니다.")
-            return {}
-        self.playwright_attempted_urls.add(url)
-
-        try:
-            from playwright.sync_api import sync_playwright
-        except ImportError:
-            if log:
-                log("Playwright가 설치되어 있지 않아 네트워크 감시 fallback을 건너뜁니다.")
-            return {}
-
-        found: Dict[str, str] = {}
-        page = None
-        try:
-            if log:
-                log("Playwright fallback 사용")
-            browser = self._playwright_browser(sync_playwright)
-            page = browser.new_page(user_agent=self.USER_AGENT)
-
-            def on_request(request) -> None:
-                req_url = request.url
-                if ".m3u8" in req_url:
-                    key = "HD" if "720p" in req_url else "stream"
-                    found.setdefault(key, req_url)
-
-            page.on("request", on_request)
-            page.goto(url, wait_until="networkidle", timeout=self.timeout * 1000)
-            page.wait_for_timeout(2500)
-        except Exception as exc:  # noqa: BLE001 - fallback should be quiet.
-            if log:
-                log(f"Playwright fallback 실패: {exc}")
-        finally:
-            if page:
-                try:
-                    page.close()
-                except Exception:
-                    pass
-
-        return found
-
-    def _playwright_browser(self, sync_playwright):
-        if self._browser:
-            return self._browser
-        self._playwright = sync_playwright().start()
-        self._browser = self._playwright.chromium.launch(headless=True)
-        return self._browser
-
     def _get_text(self, url: str, params: Optional[dict] = None, log: LogCallback = None) -> str:
+        if url.startswith(self.BASE_URL):
+            if log and not self._browser_mode_announced:
+                log("TVCF 페이지는 사용자 Chrome 프로필과 CDP 연결로 확인합니다.")
+                self._browser_mode_announced = True
+            return self._get_text_with_browser(url, params=params, log=log)
+
         if params and not self._session:
             separator = "&" if "?" in url else "?"
             url = f"{url}{separator}{urlencode(params)}"
@@ -487,6 +337,12 @@ class TVCFClient:
                 if self._session:
                     return self._get_text_with_session(url, params=params)
                 return self._get_text_with_urllib(url)
+            except TVCFError as exc:
+                if "자동 목록 접속을 차단" not in str(exc):
+                    raise
+                if log:
+                    log("TVCF 일반 HTTP 접속이 차단되어 사용자 Chrome 세션으로 전환합니다.")
+                return self._get_text_with_browser(url, params=params, log=log)
             except NETWORK_EXCEPTIONS as exc:
                 last_error = exc
                 max_attempts, wait_seconds, reason = self._retry_policy(exc)
@@ -502,6 +358,12 @@ class TVCFClient:
                 f"원인={self._retry_reason(last_error)} / 재시도={max(0, attempt - 2)}회 / {last_error}"
             ) from last_error
         raise TVCFError(f"페이지를 읽지 못했습니다: {url}")
+
+    def _get_text_with_browser(self, url: str, params: Optional[dict], log: LogCallback) -> str:
+        if params:
+            separator = "&" if "?" in url else "?"
+            url = f"{url}{separator}{urlencode(params)}"
+        return self.browser_session.get_html(url, log=log)
 
     def _get_text_with_session(self, url: str, params: Optional[dict] = None) -> str:
         if not self._session:
@@ -571,7 +433,7 @@ class TVCFClient:
         if code == 404:
             return 1, 0.0, "HTTP 404"
         if code == 403:
-            return 2, 1.0, "HTTP 403"
+            return 1, 0.0, "HTTP 403"
         if code == 429:
             return 3, 3.0, "HTTP 429"
         if 500 <= code <= 599:
@@ -626,58 +488,6 @@ class TVCFClient:
             source_page=urljoin(self.BASE_URL, f"/play/{nidx}") if nidx else "",
         )
 
-    def _json_object_after_key(self, text: str, key: str) -> dict[str, Any]:
-        if not text:
-            return {}
-        match = re.search(rf'"{re.escape(key)}"\s*:\s*\{{', text)
-        if not match:
-            return {}
-        start = text.find("{", match.start())
-        object_text = self._balanced_json_slice(text, start, "{", "}")
-        if not object_text:
-            return {}
-        try:
-            value = json.loads(object_text)
-        except json.JSONDecodeError:
-            return {}
-        return value if isinstance(value, dict) else {}
-
-    def _extract_streams_from_objects(self, *objects: dict[str, Any]) -> Dict[str, str]:
-        streams: Dict[str, str] = {}
-        for obj in objects:
-            if not obj:
-                continue
-            for quality in ("HD", "SD", "mobile", "urf", "url", "extSrc"):
-                value = self._object_field(obj, quality)
-                if value and value.startswith("http"):
-                    clean_value = self._clean_url(value)
-                    key = "youtube" if "youtu.be/" in clean_value or "youtube.com/" in clean_value else quality
-                    streams[key] = clean_value
-        return streams
-
-    def _object_field(self, obj: dict[str, Any], key: str) -> str:
-        if not obj:
-            return ""
-        value = obj.get(key)
-        if value is None:
-            value = self._find_nested_value(obj, key)
-        return self._string_value(self._first_value(value))
-
-    def _find_nested_value(self, value: Any, key: str) -> Any:
-        if isinstance(value, dict):
-            if key in value:
-                return value[key]
-            for child in value.values():
-                found = self._find_nested_value(child, key)
-                if found is not None:
-                    return found
-        elif isinstance(value, list):
-            for child in value:
-                found = self._find_nested_value(child, key)
-                if found is not None:
-                    return found
-        return None
-
     @staticmethod
     def _first_value(value: Any) -> Any:
         if isinstance(value, list):
@@ -700,55 +510,6 @@ class TVCFClient:
             return float(value)
         except (TypeError, ValueError):
             return None
-
-    def _extract_streams(self, text: str) -> Dict[str, str]:
-        streams: Dict[str, str] = {}
-        for quality in ("HD", "SD", "mobile", "urf", "url", "extSrc"):
-            value = self._field(text, quality)
-            if value and value.startswith("http"):
-                clean_value = self._clean_url(value)
-                key = "youtube" if "youtu.be/" in clean_value or "youtube.com/" in clean_value else quality
-                streams[key] = clean_value
-
-        for url in self._m3u8_re.findall(text):
-            cleaned = self._clean_url(url)
-            key = "HD" if "720p" in cleaned else "stream"
-            streams.setdefault(key, cleaned)
-
-        return streams
-
-    def _candidate_urls(self, identifier: str) -> Iterable[str]:
-        value = identifier.strip()
-        if not value:
-            return []
-
-        if value.startswith("http://") or value.startswith("https://"):
-            return [value]
-
-        value = value.strip("/")
-        if "/play/" in value:
-            value = value.rsplit("/play/", 1)[-1]
-
-        return [
-            f"{self.BASE_URL}/play/{value}",
-            f"https://play.tvcf.co.kr/{value}",
-        ]
-
-    @staticmethod
-    def _slice_after(text: str, marker: str, length: int) -> str:
-        match = re.search(marker, text)
-        if not match:
-            return ""
-        start = match.start()
-        return text[start : start + length]
-
-    @staticmethod
-    def _slug_from_url(url: str) -> str:
-        return url.rstrip("/").rsplit("/", 1)[-1]
-
-    @staticmethod
-    def _clean_url(value: str) -> str:
-        return unescape(value).replace("\\u0026", "&")
 
     @classmethod
     def _field(cls, block: str, name: str) -> str:
@@ -794,13 +555,6 @@ class TVCFClient:
             return json.loads(f'"{value}"')
         except json.JSONDecodeError:
             return unescape(value.replace('\\"', '"').replace("\\/", "/"))
-
-    @staticmethod
-    def _meta_title(html: str) -> str:
-        match = re.search(r"<title>(.*?)</title>", html, re.S | re.I)
-        if not match:
-            return ""
-        return unescape(match.group(1)).replace("| TVCF", "").strip()
 
 
 def filter_korean_ads(items: Iterable[MediaItem]) -> List[MediaItem]:

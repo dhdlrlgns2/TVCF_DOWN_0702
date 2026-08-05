@@ -11,7 +11,7 @@ from tkinter import BooleanVar, Canvas, Frame, IntVar, PhotoImage, StringVar, Tk
 from tkinter import messagebox, ttk
 from tkinter.scrolledtext import ScrolledText
 
-from .client import TVCFClient, TVCFError
+from .client import TVCFClient
 from .config import PROJECT_ROOT, load_config, save_config
 from .diagnostics import SessionLog, classify_error, save_error_case
 from .downloader import DownloadCancelled, download_media, prepare_download_tools
@@ -20,6 +20,7 @@ from .history import flush_history
 from .issue_reporter import report_error_cases
 from .models import MediaItem
 from .text_utils import decode_output
+from .youtube_search import find_youtube_media
 
 
 COLORS = {
@@ -59,10 +60,11 @@ ERROR_STATUSES = {
     "접근 거부",
     "요청 제한",
     "알 수 없는 오류",
+    "YouTube 일치 없음",
 }
 DEFERRED_RETRY_STATUSES = ERROR_STATUSES | {"중단됨", "보류"}
 DONE_STATUSES = {"완료", "재다운완료"}
-ACTIVE_STATUSES = {"상세 확인", "다운로드", "재시도", "대기열에 다시 추가됨"}
+ACTIVE_STATUSES = {"상세 확인", "YouTube 검색", "다운로드", "재시도", "대기열에 다시 추가됨"}
 QUALITY_OPTIONS = ("가능한 최고화질", "HD", "SD", "mobile")
 DATE_BASIS_LABELS = {
     "published": "방영일",
@@ -967,9 +969,9 @@ class DownloaderApp(DownloadWorkerMixin):
         date_basis = str(options.get("date_basis", "published"))
         position = self._item_position_text(1, 1, item, date_basis)
 
-        self._checkpoint(f"{self.run_summary} / {position} 상세 확인 중 / {label}")
-        self.events.put(("item_status", row_id, "상세 확인"))
-        detail = self._get_media_for_retry(client, item, use_playwright=bool(options.get("use_playwright_fallback", True)))
+        self._checkpoint(f"{self.run_summary} / {position} YouTube 검색 중 / {label}")
+        self.events.put(("item_status", row_id, "YouTube 검색"))
+        detail = self._get_media_for_retry(client, item, options)
 
         if detail.country_code and detail.country_code != "410":
             self._record_session("한국 아님", "재다운로드", detail, "한국 광고가 아니어서 제외")
@@ -1003,15 +1005,15 @@ class DownloaderApp(DownloadWorkerMixin):
             raise
         except Exception as first_exc:  # noqa: BLE001 - one alternate recovery pass.
             self.events.put(("log", f"기본 재다운로드 실패: {first_exc}"))
-            self.events.put(("log", "대체 방식으로 재시도합니다: 상세 정보 재조회 + ffmpeg 우선"))
-            detail = self._get_media_for_retry(client, merged, force_playwright=True, use_playwright=True)
+            self.events.put(("log", "YouTube 후보를 다시 확인한 뒤 yt-dlp로 한 번 더 시도합니다."))
+            detail = self._get_media_for_retry(client, merged, options, force_refresh=True)
             merged = self._merge_item(merged, detail)
             output = download_media(
                 merged,
                 str(options.get("download_dir", "")),
                 str(options.get("quality", "가능한 최고화질")),
                 date_basis,
-                prefer_ytdlp=False,
+                prefer_ytdlp=True,
                 log=lambda msg: self.events.put(("log", msg)),
                 should_stop=self.stop_event.is_set,
                 force=True,
@@ -1029,62 +1031,22 @@ class DownloaderApp(DownloadWorkerMixin):
         self,
         client: TVCFClient,
         item: MediaItem,
-        force_playwright: bool = False,
-        use_playwright: bool = True,
+        options: dict[str, object],
+        force_refresh: bool = False,
     ) -> MediaItem:
-        if not force_playwright:
+        if not force_refresh:
             cached = self._cached_media(item)
             if cached:
                 return cached
-
-        identifiers = [
-            item.nidx or item.play_url or item.idx,
-            item.play_url,
-            item.source_page,
-            item.nidx,
-            item.idx,
-            item.mcode,
-        ]
-        errors: list[str] = []
-        seen: set[str] = set()
-        for identifier in identifiers:
-            if not identifier or identifier in seen:
-                continue
-            seen.add(identifier)
-            if not force_playwright:
-                cached = self._cached_media(identifier)
-                if cached:
-                    return cached
-            try:
-                detail = client.get_media(
-                    identifier,
-                    use_playwright_fallback=force_playwright or use_playwright,
-                    log=lambda msg: self.events.put(("log", msg)),
-                )
-                self._remember_media_detail(item, detail, identifier)
-                return detail
-            except Exception as exc:  # noqa: BLE001 - try another identifier.
-                errors.append(f"{identifier}: {exc}")
-
-        raise TVCFError("; ".join(errors) if errors else "상세 정보를 찾지 못했습니다.")
-
-    def _get_media_detail(
-        self,
-        client: TVCFClient,
-        item: MediaItem,
-        use_playwright: bool,
-    ) -> MediaItem:
-        cached = self._cached_media(item)
-        if cached:
-            return cached
-
-        identifier = item.nidx or item.play_url or item.idx
-        detail = client.get_media(
-            identifier,
-            use_playwright_fallback=use_playwright,
+        tools = options.get("tools")
+        detail = find_youtube_media(
+            item,
+            ytdlp_cmd=getattr(tools, "ytdlp_cmd", None),
             log=lambda msg: self.events.put(("log", msg)),
+            should_stop=self.stop_event.is_set,
+            force_refresh=force_refresh,
         )
-        self._remember_media_detail(item, detail, identifier)
+        self._remember_media_detail(item, detail, item.nidx, item.idx, item.mcode)
         return detail
 
     def _cached_media(self, value: MediaItem | str) -> MediaItem | None:
@@ -1164,7 +1126,10 @@ class DownloaderApp(DownloadWorkerMixin):
             "date_basis": date_basis,
             "file_date": item.date_label(date_basis) if item else "",
             "playwright_fallback_count": self.playwright_fallback_count,
-            "retry_policy": "network/timeout/HTTP 5xx up to 3, HTTP 429 delayed retry, HTTP 403 one fallback, HTTP 404 no retry",
+            "retry_policy": (
+                "network/timeout/HTTP 5xx up to 3, HTTP 429 delayed retry, "
+                "HTTP 403/404 no retry, TVCF title metadata + verified YouTube match"
+            ),
         }
         try:
             error_path = save_error_case(item, stage, exc, context)
@@ -1774,7 +1739,7 @@ class DownloaderApp(DownloadWorkerMixin):
             return "done"
         if status in {"건너뜀", "대기"}:
             return "skip"
-        if status in {"상세 확인", "다운로드", "재시도"}:
+        if status in {"상세 확인", "YouTube 검색", "다운로드", "재시도"}:
             return "active"
         if status in {"한국 아님", "광고 아님", "대기열에 다시 추가됨"}:
             return "warning"

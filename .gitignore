@@ -14,6 +14,7 @@ logs/
 *.zip
 
 bin/
+.tvcf_chrome_profile/
 
 .DS_Store
 Thumbs.db

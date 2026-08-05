@@ -29,12 +29,16 @@ def classify_error(stage: str, exc: BaseException | str) -> str:
     lower = message.lower()
     stage_lower = stage.lower()
 
+    if exc.__class__.__name__ == "YouTubeMatchError":
+        return "YouTube 일치 없음"
     if "스트림" in message and ("없" in message or "찾지" in message):
         return "스트림 없음"
     if "HTTP 404" in message:
         return "상세 오류"
     if "HTTP 403" in message:
         return "접근 거부"
+    if "YouTube" in message and ("일치" in message or "검색 결과" in message or "검색에 사용할" in message):
+        return "YouTube 일치 없음"
     if "HTTP 429" in message:
         return "요청 제한"
     if any(f"HTTP {code}" in message for code in ("500", "502", "503", "504")):
