@@ -73,7 +73,13 @@ def _build_title(cases: list[dict]) -> str:
     category = first.get("category", "다운로드 오류")
     if len(cases) == 1:
         item = first.get("item", {})
-        title = item.get("display_title") or item.get("nidx") or item.get("idx") or "알 수 없는 영상"
+        title = (
+            item.get("display_title")
+            or item.get("nidx")
+            or item.get("idx")
+            or first.get("stage")
+            or "전체 작업"
+        )
         return f"[TVCF 오류] {category} - {title}"[:250]
     return f"[TVCF 오류 묶음] {category} 외 {len(cases) - 1}건"[:250]
 

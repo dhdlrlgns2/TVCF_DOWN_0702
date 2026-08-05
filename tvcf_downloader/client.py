@@ -49,6 +49,12 @@ class TVCFClient:
     _record_re = re.compile(r'\{\\"idx\\":\\"(?P<idx>\d+)\\".*?\\"_score\\":(?:null|\[[^\]]*\])\}', re.S)
     _m3u8_re = re.compile(r"https?://[^\"\\]+?\.m3u8(?:\?[^\"\\]*)?")
 
+    _automation_block_markers = (
+        "자동화된 브라우저에서의 접속은 허용되지 않습니다",
+        "Automated browser access is not allowed",
+        "비정상적인 접근이 감지되었습니다",
+    )
+
     def __init__(self, timeout: int = 25, delay: float = 0.0) -> None:
         self.timeout = timeout
         self.delay = delay
@@ -501,6 +507,7 @@ class TVCFClient:
         if not self._session:
             raise TVCFError("HTTP 세션이 초기화되지 않았습니다.")
         response = self._session.get(url, params=params, timeout=self.timeout)
+        self._raise_if_automation_blocked(response.status_code, response.text)
         response.raise_for_status()
         if not response.encoding:
             response.encoding = "utf-8"
@@ -508,19 +515,35 @@ class TVCFClient:
 
     def _get_text_with_urllib(self, url: str) -> str:
         request = Request(url, headers=self.headers)
-        with urlopen(request, timeout=self.timeout) as response:
-            try:
-                raw = response.read()
-            except IncompleteRead as exc:
-                raw = exc.partial
-                if not raw or len(raw) < 2048:
-                    raise
-            content_type = response.headers.get("Content-Type", "")
-            encoding = "utf-8"
-            match = re.search(r"charset=([\w-]+)", content_type, re.I)
-            if match:
-                encoding = match.group(1)
-            return decode_output(raw, preferred=encoding)
+        try:
+            with urlopen(request, timeout=self.timeout) as response:
+                try:
+                    raw = response.read()
+                except IncompleteRead as exc:
+                    raw = exc.partial
+                    if not raw or len(raw) < 2048:
+                        raise
+                content_type = response.headers.get("Content-Type", "")
+                encoding = "utf-8"
+                match = re.search(r"charset=([\w-]+)", content_type, re.I)
+                if match:
+                    encoding = match.group(1)
+                return decode_output(raw, preferred=encoding)
+        except HTTPError as exc:
+            if exc.code == 403:
+                body = decode_output(exc.read(), preferred="utf-8")
+                self._raise_if_automation_blocked(exc.code, body)
+            raise
+
+    @classmethod
+    def _raise_if_automation_blocked(cls, status_code: int, body: str) -> None:
+        if status_code != 403:
+            return
+        if any(marker in body for marker in cls._automation_block_markers):
+            raise TVCFError(
+                "HTTP 403: TVCF가 프로그램의 자동 목록 접속을 차단했습니다. "
+                "일반 브라우저 접속만 허용한다는 서버 응답이므로 같은 요청을 재시도하지 않습니다."
+            )
 
     @staticmethod
     def _retry_policy(exc: Exception) -> tuple[int, float, str]:

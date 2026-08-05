@@ -133,9 +133,11 @@ class DownloaderApp(DownloadWorkerMixin):
         self.media_cache: dict[str, tuple[MediaItem, float]] = {}
         self.media_cache_lock = threading.Lock()
         self.session_lock = threading.Lock()
+        self.error_paths_lock = threading.Lock()
         self.run_summary = ""
         self.last_checkpoint = self.config.get("last_checkpoint", "작업 없음")
         self.error_case_by_id: dict[str, str] = {}
+        self.run_error_paths: list[str] = []
         self.session_log: SessionLog | None = None
         self.run_started_at: float = 0.0
         self.playwright_fallback_count = 0
@@ -828,9 +830,12 @@ class DownloaderApp(DownloadWorkerMixin):
 
     def _report_selected_errors(self) -> None:
         row_ids = self._error_rows()
-        paths = [Path(self.error_case_by_id[row_id]) for row_id in row_ids if row_id in self.error_case_by_id]
+        row_paths = [self.error_case_by_id[row_id] for row_id in row_ids if row_id in self.error_case_by_id]
+        with self.error_paths_lock:
+            run_paths = list(self.run_error_paths)
+        paths = [Path(path) for path in dict.fromkeys([*row_paths, *run_paths]) if Path(path).is_file()]
         if not paths:
-            self._log("신고할 오류 로그가 없습니다. 목록에 오류 상태인 항목이 있는지 확인해주세요.")
+            self._log("신고할 오류 로그가 없습니다. 이번 실행에서 오류가 저장되었는지 확인해주세요.")
             return
 
         self._log(f"기훈이한테 이를 오류 {len(paths)}건을 GitHub 이슈로 업로드합니다.")
@@ -1163,6 +1168,8 @@ class DownloaderApp(DownloadWorkerMixin):
         }
         try:
             error_path = save_error_case(item, stage, exc, context)
+            with self.error_paths_lock:
+                self.run_error_paths.append(str(error_path))
             if row_id:
                 self.events.put(("error_case", row_id, str(error_path)))
             self.events.put(("log", f"오류 로그 저장: {error_path}"))
@@ -1222,6 +1229,8 @@ class DownloaderApp(DownloadWorkerMixin):
 
         self.stop_event.clear()
         self.stop_requested_by_user = False
+        with self.error_paths_lock:
+            self.run_error_paths.clear()
         self._save_current_config()
         self.run_summary = self._build_run_summary()
         self.session_log = SessionLog(self.run_summary)
